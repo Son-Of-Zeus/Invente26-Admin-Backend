@@ -9,6 +9,7 @@ const router = express.Router();
 
 const PAYMENT_STATUSES = ['PendingPayment', 'NotVerified', 'Accepted', 'Rejected'];
 const DECISION_STATUSES = ['Accepted', 'Rejected'];
+const TICKET_TYPES = ['HACKATHON', 'TECHPASS', 'NONTECHPASS', 'RACING', 'WORKSHOP'];
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DEFAULT_PAGE_SIZE = 25;
 const MAX_PAGE_SIZE = 100;
@@ -64,15 +65,29 @@ function validateStatusFilter(value) {
   return status;
 }
 
+function validateTicketTypeFilter(value) {
+  const type = typeof value === 'string' && value.trim() ? value.trim() : 'all';
+  if (type !== 'all' && !TICKET_TYPES.includes(type)) {
+    throw httpError(400, 'INVALID_TICKET_TYPE', `ticket_type must be one of: all, ${TICKET_TYPES.join(', ')}`);
+  }
+  return type;
+}
+
 function buildSubmissionFilter(query) {
   const conditions = [];
   const params = [];
   const status = validateStatusFilter(query.status);
+  const ticketType = validateTicketTypeFilter(query.ticket_type);
   const search = typeof query.search === 'string' ? query.search.trim() : '';
 
   if (status !== 'all') {
     params.push(status);
     conditions.push(`tp.status = $${params.length}`);
+  }
+
+  if (ticketType !== 'all') {
+    params.push(ticketType);
+    conditions.push(`tp.ticket_type = $${params.length}`);
   }
 
   if (search) {
