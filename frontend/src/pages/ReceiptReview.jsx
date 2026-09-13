@@ -50,6 +50,7 @@ function ReceiptReviewPage() {
   const [registration, setRegistration] = useState(null);
   const [registrationLoading, setRegistrationLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState("all");
+  const [ticketTypeFilter, setTicketTypeFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [page, setPage] = useState(1);
@@ -101,6 +102,7 @@ function ReceiptReviewPage() {
         const response = await authAxios.get("/receipt-review/submissions", {
           params: {
             status: statusFilter === "all" ? undefined : statusFilter,
+            ticket_type: ticketTypeFilter === "all" ? undefined : ticketTypeFilter,
             search: debouncedSearch || undefined,
             page,
             page_size: PAGE_SIZE,
@@ -121,7 +123,7 @@ function ReceiptReviewPage() {
     return () => {
       active = false;
     };
-  }, [authAxios, debouncedSearch, page, refreshVersion, registration, statusFilter]);
+  }, [authAxios, debouncedSearch, page, refreshVersion, registration, statusFilter, ticketTypeFilter]);
 
   useEffect(() => {
     if (!registration?.registered || !selectedId) {
@@ -217,6 +219,24 @@ function ReceiptReviewPage() {
               placeholder="Start typing to filter…"
               className="mt-1 w-full rounded border p-2 font-normal"
             />
+          </label>
+          <label className="text-sm font-medium text-gray-700 md:w-56">
+            Ticket Type
+            <select
+              value={ticketTypeFilter}
+              onChange={(event) => {
+                setTicketTypeFilter(event.target.value);
+                setPage(1);
+              }}
+              className="mt-1 w-full rounded border bg-white p-2 font-normal"
+            >
+              <option value="all">All types</option>
+              <option value="HACKATHON">Hackathon</option>
+              <option value="TECHPASS">Tech Pass</option>
+              <option value="NONTECHPASS">Non-Tech Pass</option>
+              <option value="RACING">Racing</option>
+              <option value="WORKSHOP">Workshop</option>
+            </select>
           </label>
           <label className="text-sm font-medium text-gray-700 md:w-56">
             Status
