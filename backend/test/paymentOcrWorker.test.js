@@ -27,11 +27,14 @@ function createHarness({
   ack = 1,
   azureError,
   updateRows = [{ ticket_id: TICKET_ID }],
+  transactionPayment,
+  transactionErrorAt,
 } = {}) {
   const order = [];
   const logs = [];
   const queries = [];
   let azureCalls = 0;
+  const currentPayment = { ...(transactionPayment || payment) };
 
   const redis = {
     async xack(...args) {
@@ -44,8 +47,38 @@ function createHarness({
     async query(sql, params) {
       queries.push({ sql, params });
       if (sql.includes('SELECT ticket_id')) return { rows: payment ? [payment] : [] };
-      order.push('database_update');
-      return { rows: updateRows };
+      throw new Error(`unexpected pool query: ${sql}`);
+    },
+    async getClient() {
+      return {
+        async query(sql, params) {
+          queries.push({ sql, params, transaction: true });
+          if (sql === 'BEGIN') {
+            order.push('transaction_begin');
+          } else if (sql.includes('hashtextextended')) {
+            order.push('advisory_lock');
+          } else if (sql.includes('FOR UPDATE')) {
+            order.push('row_lock');
+            return { rows: currentPayment ? [currentPayment] : [] };
+          } else if (sql.startsWith('UPDATE')) {
+            order.push('database_update');
+            if (transactionErrorAt === 'update') throw new Error('write failed');
+            if (updateRows.length > 0) currentPayment.payment_id = params[0];
+            return { rows: updateRows };
+          } else if (sql === 'COMMIT') {
+            order.push('transaction_commit');
+          } else if (sql === 'ROLLBACK') {
+            order.push('transaction_rollback');
+          } else {
+            throw new Error(`unexpected transaction query: ${sql}`);
+          }
+          if (transactionErrorAt === sql) throw new Error(`${sql} failed`);
+          return { rows: [] };
+        },
+        release() {
+          order.push('transaction_release');
+        },
+      };
     },
   };
   const documentIntelligence = {
@@ -89,9 +122,21 @@ test('saves the first payment ID before acknowledging the entry', async () => {
   const outcome = await harness.worker.processEntry('1-0', streamFields());
 
   assert.equal(outcome, 'payment_id_saved');
-  assert.deepEqual(harness.order, ['azure', 'database_update', 'ack']);
-  assert.equal(harness.queries[1].params[0], 'pay_1234567890ABCD');
-  assert.match(harness.queries[1].sql, /payment_id = 'queued'/);
+  assert.deepEqual(harness.order, [
+    'azure',
+    'transaction_begin',
+    'advisory_lock',
+    'row_lock',
+    'database_update',
+    'transaction_commit',
+    'transaction_release',
+    'ack',
+  ]);
+  const advisoryLockQuery = harness.queries.find(query => query.sql.includes('hashtextextended'));
+  assert.deepEqual(advisoryLockQuery.params, ['pay_1234567890ABCD']);
+  const updateQuery = harness.queries.find(query => query.sql.startsWith('UPDATE'));
+  assert.equal(updateQuery.params[0], 'pay_1234567890ABCD');
+  assert.match(updateQuery.sql, /payment_id = 'queued'/);
   assert.equal(harness.logs[0].outcome, 'payment_id_saved');
 });
 
@@ -176,7 +221,64 @@ test('acknowledges when a concurrent writer wins the guarded update', async () =
     await harness.worker.processEntry('1-0', streamFields()),
     'payment_id_write_lost_race',
   );
-  assert.deepEqual(harness.order, ['azure', 'database_update', 'ack']);
+  assert.deepEqual(harness.order, [
+    'azure',
+    'transaction_begin',
+    'advisory_lock',
+    'row_lock',
+    'database_update',
+    'transaction_commit',
+    'transaction_release',
+    'ack',
+  ]);
+});
+
+test('revalidates the locked row and leaves a raced terminal value unchanged', async () => {
+  const harness = createHarness({
+    payment: { ticket_id: TICKET_ID, status: 'NotVerified', payment_id: 'queued' },
+    transactionPayment: {
+      ticket_id: TICKET_ID,
+      status: 'NotVerified',
+      payment_id: 'pay_other_writer',
+    },
+  });
+
+  assert.equal(
+    await harness.worker.processEntry('1-0', streamFields()),
+    'payment_id_write_lost_race',
+  );
+  assert.deepEqual(harness.order, [
+    'azure',
+    'transaction_begin',
+    'advisory_lock',
+    'row_lock',
+    'transaction_commit',
+    'transaction_release',
+    'ack',
+  ]);
+  assert.equal(harness.queries.filter(query => query.sql.startsWith('UPDATE')).length, 0);
+});
+
+test('rolls back and releases the transaction before acknowledging a write failure', async () => {
+  const harness = createHarness({
+    payment: { ticket_id: TICKET_ID, status: 'NotVerified', payment_id: 'queued' },
+    transactionErrorAt: 'update',
+  });
+
+  assert.equal(
+    await harness.worker.processEntry('1-0', streamFields()),
+    'database_write_error',
+  );
+  assert.deepEqual(harness.order, [
+    'azure',
+    'transaction_begin',
+    'advisory_lock',
+    'row_lock',
+    'database_update',
+    'transaction_rollback',
+    'transaction_release',
+    'ack',
+  ]);
 });
 
 test('rejects when Redis does not acknowledge the processed entry', async () => {

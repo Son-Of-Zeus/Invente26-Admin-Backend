@@ -1,4 +1,8 @@
 const { extractPaymentId } = require('../utils/paymentId');
+const {
+  lockPaymentId: defaultLockPaymentId,
+  withTransaction: defaultWithTransaction,
+} = require('../utils/transaction');
 
 const STREAM_KEY = 'invente:payments:node_ocr_stream';
 const CONSUMER_GROUP = 'node-service-group';
@@ -46,6 +50,8 @@ function createPaymentOcrWorker({
   database,
   documentIntelligence,
   consumerName,
+  withTransaction = defaultWithTransaction,
+  lockPaymentId = defaultLockPaymentId,
   logger = console.log,
 }) {
   let running = false;
@@ -116,18 +122,45 @@ function createPaymentOcrWorker({
                 outcome = 'payment_id_not_found';
               } else {
                 try {
-                  const updateResult = await database.query(
-                    `UPDATE public.ticket_payments
-                     SET payment_id = $1
-                     WHERE ticket_id = $2
-                       AND status = 'NotVerified'
-                       AND payment_id = 'queued'
-                     RETURNING ticket_id`,
-                    [paymentId, ticketId],
-                  );
-                  outcome = updateResult.rows.length > 0
-                    ? 'payment_id_saved'
-                    : 'payment_id_write_lost_race';
+                  // Azure runs outside the transaction. Only the final
+                  // queued -> real-ID transition is transactional, and the
+                  // advisory lock must precede the row lock to coordinate
+                  // with manual saves using the same payment ID.
+                  const runTransaction = work => withTransaction === defaultWithTransaction
+                    ? withTransaction(work, database)
+                    : withTransaction(work);
+                  outcome = await runTransaction(async client => {
+                    await lockPaymentId(client, paymentId);
+
+                    const currentResult = await client.query(
+                      `SELECT ticket_id, status, payment_id
+                       FROM public.ticket_payments
+                       WHERE ticket_id = $1
+                       FOR UPDATE`,
+                      [ticketId],
+                    );
+                    const current = currentResult.rows[0];
+                    if (
+                      !current
+                      || current.status !== 'NotVerified'
+                      || current.payment_id !== 'queued'
+                    ) {
+                      return 'payment_id_write_lost_race';
+                    }
+
+                    const updateResult = await client.query(
+                      `UPDATE public.ticket_payments
+                       SET payment_id = $1
+                       WHERE ticket_id = $2
+                         AND status = 'NotVerified'
+                         AND payment_id = 'queued'
+                       RETURNING ticket_id`,
+                      [paymentId, ticketId],
+                    );
+                    return updateResult.rows.length > 0
+                      ? 'payment_id_saved'
+                      : 'payment_id_write_lost_race';
+                  });
                 } catch (error) {
                   outcome = 'database_write_error';
                 }

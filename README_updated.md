@@ -17,6 +17,8 @@ Implemented here:
 - Volunteer accounts stored in the `verification` table.
 - Volunteer queue, debounced search, status filter, payment detail, PDF
   display, and decision UI.
+- Exact payment-ID conflict grouping with side-by-side receipt comparison,
+  one-winner resolution, resolved history, and automatic rival rejection.
 - Transactional `Accepted`/`Rejected` decisions with a verification log.
 - Redis Streams payment OCR worker using Azure Document Intelligence.
 - Indexed exact payment-ID search and guarded manual payment-ID entry.
@@ -205,6 +207,9 @@ GET   /receipt-review/submissions
 GET   /receipt-review/submissions/:ticketId
 PATCH /receipt-review/submissions/:ticketId/payment-id
 PATCH /receipt-review/submissions/:ticketId/decision
+GET   /receipt-review/conflicts
+GET   /receipt-review/conflicts/:paymentId
+PATCH /receipt-review/conflicts/:paymentId/decision
 ```
 
 `GET /volunteers/me` returns the account represented by the JWT. Signup is
@@ -262,6 +267,46 @@ Request:
 The write locks the payment row and never overwrites an ID saved by OCR or a
 different volunteer. Exact `pay_` searches use the existing payment-ID B-tree
 index; other search terms retain the general case-insensitive search.
+
+### Payment-ID conflicts
+
+The conflict list is grouped and paginated in PostgreSQL; the frontend never
+loads the complete payment table to find duplicates. A conflict is two or more
+rows with the same exact, case-sensitive valid `pay_` ID.
+
+```text
+GET /receipt-review/conflicts?state=unresolved|resolved&search=&page=1&page_size=25
+GET /receipt-review/conflicts/:paymentId
+```
+
+Opening a group loads only that payment ID's submissions and returns their
+participant/event details, audit history, and PDF URLs. The volunteer resolves
+the group with:
+
+```text
+PATCH /receipt-review/conflicts/:paymentId/decision
+```
+
+```json
+{
+  "winner_ticket_id": "payment-ticket-uuid"
+}
+```
+
+The transaction accepts the selected `NotVerified` row and rejects every other
+undecided candidate. If one candidate was already Accepted, it is the locked
+winner and confirming the group rejects only its undecided rivals. Each changed
+row receives its own verification-log entry. Missing receipt URLs and invalid
+historical states are displayed but cannot be resolved.
+
+Conflict resolution, manual payment-ID entry, OCR writes, and ordinary receipt
+decisions share a transaction-level PostgreSQL advisory lock derived from the
+exact payment ID. This keeps group validation and updates atomic without a new
+table or schema migration. Individual decisions on unresolved duplicate groups
+return `CONFLICT_REVIEW_REQUIRED` and must be completed in the comparison UI.
+
+Rejected rivals use the existing `Rejected` status; the participant backend's
+existing rejection poller remains responsible for sending emails.
 
 ## Payment OCR worker
 
