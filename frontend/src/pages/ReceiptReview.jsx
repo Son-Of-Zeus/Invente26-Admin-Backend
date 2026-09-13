@@ -3,6 +3,7 @@ import { useAuth } from "../hooks/useAuth";
 
 const PAYMENT_STATUSES = ["PendingPayment", "NotVerified", "Accepted", "Rejected"];
 const PAGE_SIZE = 25;
+const PAYMENT_ID_PATTERN = /^pay_[A-Za-z0-9]{14}$/;
 
 function getErrorMessage(error, fallback = "Something went wrong") {
   return error?.response?.data?.error || error?.message || fallback;
@@ -61,6 +62,9 @@ function ReceiptReviewPage() {
   const [listLoading, setListLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
+  const [paymentIdLoading, setPaymentIdLoading] = useState(false);
+  const [manualPaymentId, setManualPaymentId] = useState("");
+  const [manualEntryError, setManualEntryError] = useState(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [error, setError] = useState(null);
   const [message, setMessage] = useState(null);
@@ -126,6 +130,11 @@ function ReceiptReviewPage() {
   }, [authAxios, debouncedSearch, page, refreshVersion, registration, statusFilter, ticketTypeFilter]);
 
   useEffect(() => {
+    setManualPaymentId("");
+    setManualEntryError(null);
+  }, [selectedId]);
+
+  useEffect(() => {
     if (!registration?.registered || !selectedId) {
       setDetail(null);
       return undefined;
@@ -169,6 +178,29 @@ function ReceiptReviewPage() {
     }
   }
 
+  async function savePaymentId() {
+    if (!selectedId || detail?.payment_id !== "queued") return;
+
+    setPaymentIdLoading(true);
+    setManualEntryError(null);
+    setMessage(null);
+    try {
+      await authAxios.patch(`/receipt-review/submissions/${selectedId}/payment-id`, {
+        payment_id: manualPaymentId,
+      });
+      setManualPaymentId("");
+      setMessage("Payment ID saved.");
+      setRefreshVersion((current) => current + 1);
+    } catch (requestError) {
+      setManualEntryError(getErrorMessage(requestError, "Could not save the payment ID"));
+      if (requestError?.response?.status === 409) {
+        setRefreshVersion((current) => current + 1);
+      }
+    } finally {
+      setPaymentIdLoading(false);
+    }
+  }
+
   if (registrationLoading) {
     return <div className="mx-auto max-w-7xl p-6 text-gray-600">Checking volunteer signup…</div>;
   }
@@ -188,6 +220,7 @@ function ReceiptReviewPage() {
 
   const events = detail?.events || [];
   const members = detail?.hackathon?.members || [];
+  const hasValidPaymentId = PAYMENT_ID_PATTERN.test(detail?.payment_id || "");
 
   return (
     <div className="mx-auto max-w-7xl p-4 md:p-6">
@@ -209,7 +242,7 @@ function ReceiptReviewPage() {
       <div className="mb-4 rounded-lg bg-white p-4 shadow-sm ring-1 ring-gray-900/5">
         <div className="flex flex-col gap-3 md:flex-row md:items-center">
           <label className="flex-1 text-sm font-medium text-gray-700">
-            Search ticket, participant, email, or team
+            Search ticket, payment ID, participant, email, or team
             <input
               value={search}
               onChange={(event) => {
@@ -384,6 +417,41 @@ function ReceiptReviewPage() {
 
               <div className="mt-6">
                 <h3 className="font-semibold text-gray-900">Receipt PDF</h3>
+                <div className="mt-2 rounded border bg-gray-50 p-3">
+                  <p className="text-xs font-medium uppercase tracking-wide text-gray-500">Payment ID</p>
+                  {hasValidPaymentId && (
+                    <p className="mt-1 break-all font-mono text-sm text-gray-900">{detail.payment_id}</p>
+                  )}
+                  {detail.payment_id === "queued" && detail.status === "NotVerified" && detail.s3_url && (
+                    <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                      <input
+                        value={manualPaymentId}
+                        onChange={(event) => setManualPaymentId(event.target.value)}
+                        placeholder="pay_ followed by 14 letters or digits"
+                        aria-label="Manual payment ID"
+                        className="min-w-0 flex-1 rounded border bg-white p-2 font-mono text-sm"
+                      />
+                      <button
+                        type="button"
+                        disabled={paymentIdLoading || !PAYMENT_ID_PATTERN.test(manualPaymentId)}
+                        onClick={savePaymentId}
+                        className="rounded bg-blue-600 px-4 py-2 font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {paymentIdLoading ? "Saving…" : "Save payment ID"}
+                      </button>
+                    </div>
+                  )}
+                  {detail.payment_id === "queued" && (!detail.s3_url || detail.status !== "NotVerified") && (
+                    <p className="mt-1 text-sm text-amber-700">Payment ID is still queued and cannot be edited in the current state.</p>
+                  )}
+                  {detail.payment_id == null && (
+                    <p className="mt-1 text-sm text-red-700">Payment ID is not in the queued state and cannot be edited.</p>
+                  )}
+                  {detail.payment_id != null && detail.payment_id !== "queued" && !hasValidPaymentId && (
+                    <p className="mt-1 text-sm text-red-700">The stored payment ID has an unexpected format and cannot be edited here.</p>
+                  )}
+                  {manualEntryError && <p className="mt-2 text-sm text-red-700">{manualEntryError}</p>}
+                </div>
                 {detail.s3_url ? (
                   <div className="mt-2">
                     <iframe
@@ -401,23 +469,28 @@ function ReceiptReviewPage() {
               </div>
 
               {detail.status === "NotVerified" ? (
-                <div className="mt-6 flex flex-wrap gap-3 border-t pt-4">
-                  <button
-                    type="button"
-                    disabled={actionLoading}
-                    onClick={() => decide("Accepted")}
-                    className="rounded bg-green-600 px-4 py-2 font-semibold text-white hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {actionLoading ? "Saving…" : "Accept"}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={actionLoading}
-                    onClick={() => decide("Rejected")}
-                    className="rounded bg-red-600 px-4 py-2 font-semibold text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {actionLoading ? "Saving…" : "Reject"}
-                  </button>
+                <div className="mt-6 border-t pt-4">
+                  {!hasValidPaymentId && (
+                    <p className="mb-3 text-sm text-amber-700">A valid payment ID is required before this payment can be accepted.</p>
+                  )}
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      type="button"
+                      disabled={actionLoading || !hasValidPaymentId}
+                      onClick={() => decide("Accepted")}
+                      className="rounded bg-green-600 px-4 py-2 font-semibold text-white hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {actionLoading ? "Saving…" : "Accept"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={actionLoading}
+                      onClick={() => decide("Rejected")}
+                      className="rounded bg-red-600 px-4 py-2 font-semibold text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {actionLoading ? "Saving…" : "Reject"}
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <p className="mt-6 border-t pt-4 text-sm text-gray-500">This payment is no longer awaiting a volunteer decision.</p>

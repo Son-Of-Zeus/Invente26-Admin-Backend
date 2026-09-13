@@ -28,7 +28,26 @@ services:
     networks:
       - default
       - payment_backend_network
-      
+
+  payment-ocr-worker:
+    build: ./backend
+    env_file:
+      - ./backend/.env
+    command: npm run worker:ocr
+    environment:
+      - TZ=Asia/Kolkata
+      - REDIS_HOST=invente-redis-dev
+      - REDIS_PORT=6379
+    stop_grace_period: 130s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - payment_backend_network
+
 volumes:
   db_data:
 networks:

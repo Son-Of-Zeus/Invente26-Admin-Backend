@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const db = require('../db');
 const { withTransaction } = require('../utils/transaction');
 const { staffJwtMiddleware, requireReceiptAccess } = require('../externalAuth');
+const { isPaymentId } = require('../utils/paymentId');
 
 const router = express.Router();
 
@@ -30,7 +31,7 @@ function httpError(status, code, message, extra = {}) {
 
 function sendDatabaseError(res, error) {
   if (error?.httpStatus) {
-    const body = { error: error.message };
+    const body = { error: error.message, code: error.code };
     if (error.currentStatus) body.current_status = error.currentStatus;
     return res.status(error.httpStatus).json(body);
   }
@@ -90,7 +91,10 @@ function buildSubmissionFilter(query) {
     conditions.push(`tp.ticket_type = $${params.length}`);
   }
 
-  if (search) {
+  if (isPaymentId(search)) {
+    params.push(search);
+    conditions.push(`tp.payment_id = $${params.length}`);
+  } else if (search) {
     params.push(`%${search}%`);
     const searchParameter = `$${params.length}`;
     conditions.push(`(
@@ -249,6 +253,7 @@ router.get('/submissions/:ticketId', requireRegisteredVolunteer, async (req, res
          tp.ticket_type,
          tp.amount_paid,
          tp.s3_url,
+         tp.payment_id,
          tp.status,
          tp.email_sent,
          tp.created_at,
@@ -351,6 +356,101 @@ router.get('/submissions/:ticketId', requireRegisteredVolunteer, async (req, res
   }
 });
 
+function logManualPaymentIdAttempt(req, ticketId, outcome) {
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    event: 'manual_payment_id',
+    volunteer_id: req.staff.volunteerId,
+    ticket_id: ticketId,
+    outcome,
+  }));
+}
+
+async function saveManualPaymentId(client, ticketId, paymentId) {
+  const paymentResult = await client.query(
+    `SELECT ticket_id, status, payment_id, s3_url
+     FROM public.ticket_payments
+     WHERE ticket_id = $1
+     FOR UPDATE`,
+    [ticketId],
+  );
+
+  if (paymentResult.rows.length === 0) {
+    throw httpError(404, 'PAYMENT_NOT_FOUND', 'ticket payment not found');
+  }
+
+  const current = paymentResult.rows[0];
+  if (current.payment_id === null) {
+    throw httpError(409, 'PAYMENT_ID_NOT_QUEUED', 'payment ID is not in the queued state');
+  }
+
+  if (current.payment_id !== 'queued') {
+    throw httpError(409, 'PAYMENT_ID_ALREADY_PRESENT', 'a payment ID is already present for this ticket');
+  }
+
+  if (current.status !== 'NotVerified') {
+    throw httpError(409, 'INVALID_PAYMENT_STATUS', 'only NotVerified payments can receive a manual payment ID', {
+      currentStatus: current.status,
+    });
+  }
+
+  if (!current.s3_url) {
+    throw httpError(409, 'RECEIPT_URL_MISSING', 'a receipt URL is required before entering a payment ID');
+  }
+
+  const updateResult = await client.query(
+    `UPDATE public.ticket_payments
+     SET payment_id = $1
+     WHERE ticket_id = $2
+       AND status = 'NotVerified'
+       AND payment_id = 'queued'
+     RETURNING ticket_id, payment_id, updated_at`,
+    [paymentId, ticketId],
+  );
+
+  if (updateResult.rows.length === 0) {
+    throw httpError(409, 'PAYMENT_ID_ALREADY_PRESENT', 'a payment ID is already present for this ticket');
+  }
+
+  return updateResult.rows[0];
+}
+
+function validatePaymentIdForDecision(status, paymentId) {
+  if (status === 'Accepted' && !isPaymentId(paymentId)) {
+    throw httpError(409, 'PAYMENT_ID_REQUIRED', 'a valid payment ID is required before accepting this payment');
+  }
+}
+
+router.patch('/submissions/:ticketId/payment-id', requireRegisteredVolunteer, async (req, res) => {
+  const { ticketId } = req.params;
+  const paymentId = req.body?.payment_id;
+
+  if (!isUuid(ticketId)) {
+    return res.status(400).json({
+      error: 'ticket ID must be a valid UUID',
+      code: 'INVALID_TICKET_ID',
+    });
+  }
+
+  if (!isPaymentId(paymentId)) {
+    logManualPaymentIdAttempt(req, ticketId, 'invalid_payment_id');
+    return res.status(400).json({
+      error: 'payment_id must match pay_ followed by exactly 14 letters or digits',
+      code: 'INVALID_PAYMENT_ID',
+    });
+  }
+
+  try {
+    const payment = await withTransaction(client => saveManualPaymentId(client, ticketId, paymentId));
+
+    logManualPaymentIdAttempt(req, ticketId, 'payment_id_saved');
+    return res.json({ payment });
+  } catch (error) {
+    logManualPaymentIdAttempt(req, ticketId, error.code || 'database_error');
+    return sendDatabaseError(res, error);
+  }
+});
+
 router.patch('/submissions/:ticketId/decision', requireRegisteredVolunteer, async (req, res) => {
   const { ticketId } = req.params;
   const { status } = req.body || {};
@@ -380,7 +480,7 @@ router.patch('/submissions/:ticketId/decision', requireRegisteredVolunteer, asyn
       }
 
       const paymentResult = await client.query(
-        `SELECT ticket_id, status
+        `SELECT ticket_id, status, payment_id
          FROM public.ticket_payments
          WHERE ticket_id = $1
          FOR UPDATE`,
@@ -397,6 +497,8 @@ router.patch('/submissions/:ticketId/decision', requireRegisteredVolunteer, asyn
           currentStatus,
         });
       }
+
+      validatePaymentIdForDecision(status, paymentResult.rows[0].payment_id);
 
       const updatedPayment = await client.query(
         `UPDATE public.ticket_payments
@@ -424,3 +526,8 @@ router.patch('/submissions/:ticketId/decision', requireRegisteredVolunteer, asyn
 });
 
 module.exports = router;
+module.exports._test = {
+  buildSubmissionFilter,
+  saveManualPaymentId,
+  validatePaymentIdForDecision,
+};

@@ -18,19 +18,21 @@ Implemented here:
 - Volunteer queue, debounced search, status filter, payment detail, PDF
   display, and decision UI.
 - Transactional `Accepted`/`Rejected` decisions with a verification log.
+- Redis Streams payment OCR worker using Azure Document Intelligence.
+- Indexed exact payment-ID search and guarded manual payment-ID entry.
 
 Not implemented in this repository:
 
 - Participant registration, Razorpay integration, or the participant PATCH
   API.
-- Redis streams, ticket creation, QR generation, or participant email.
+- Redis stream production, ticket creation, QR generation, or participant email.
 - Attendance changes.
 - Database migrations.
 
 The legacy unauthenticated OCR receipt routes are no longer mounted. New
 participant uploads must use the Azure flow below.
 
-The participant frontend and worker project remain separate systems.
+The participant frontend and Redis stream producer remain separate systems.
 
 ## Database contract
 
@@ -38,7 +40,7 @@ The supplied `V1__Initial_schema.sql` is authoritative. This service uses
 only its existing tables and columns, especially:
 
 - `ticket_payments` — `ticket_id`, `ticket_type`, `amount_paid`, `s3_url`,
-  `status`, and timestamps.
+  `payment_id`, `status`, and timestamps.
 - `users` — participant details.
 - `ticket_event` and `events` — events associated with a payment.
 - `hackathon_regs` and `hackathon_members` — hackathon team data.
@@ -81,6 +83,13 @@ This backend ── direct database reads ──► queue/detail/PDF
   │
   └── PATCH decision ── transaction + FOR UPDATE ──► ticket_payments
                                       └────────────► payment_verification_log
+
+Payment backend Redis stream
+  │ invente:payments:node_ocr_stream
+  ▼
+OCR worker ── prebuilt-read(pdfUrl) ──► Azure Document Intelligence
+  │
+  └── guarded queued → pay_* update ──► ticket_payments.payment_id
 ```
 
 This backend does not update `s3_url` or the participant status during the
@@ -194,6 +203,7 @@ account in `verification`.
 GET   /receipt-review/volunteers/me
 GET   /receipt-review/submissions
 GET   /receipt-review/submissions/:ticketId
+PATCH /receipt-review/submissions/:ticketId/payment-id
 PATCH /receipt-review/submissions/:ticketId/decision
 ```
 
@@ -205,7 +215,7 @@ List query parameters:
 
 ```text
 status=all|PendingPayment|NotVerified|Accepted|Rejected
-search=<ticket id, participant name/email, or hackathon team>
+search=<ticket id, complete payment ID, participant name/email, or hackathon team>
 page=1
 page_size=25
 ```
@@ -233,6 +243,49 @@ the payment row with `FOR UPDATE`, updates `ticket_payments`, and inserts a
 row into `payment_verification_log` using the registered volunteer UUID. A
 second concurrent decision receives a conflict after the first transaction
 commits.
+
+An `Accepted` decision additionally requires a valid `payment_id`. While the
+value is exactly `queued`, volunteers can save a strict Razorpay ID through:
+
+```text
+PATCH /receipt-review/submissions/:ticketId/payment-id
+```
+
+Request:
+
+```json
+{
+  "payment_id": "pay_1234567890ABCD"
+}
+```
+
+The write locks the payment row and never overwrites an ID saved by OCR or a
+different volunteer. Exact `pay_` searches use the existing payment-ID B-tree
+index; other search terms retain the general case-insensitive search.
+
+## Payment OCR worker
+
+Run the standalone worker with:
+
+```text
+npm run worker:ocr
+```
+
+It consumes `invente:payments:node_ocr_stream` through consumer group
+`node-service-group`. Each entry must contain `ticket_id`, `pdfUrl`, and
+`action_type=ocr`. Only `NotVerified` rows whose payment ID is exactly
+`queued` are submitted to Azure's `prebuilt-read` model. Each entry is
+acknowledged after its terminal outcome; failed OCR remains `queued` for
+manual entry. Stale pending entries become claimable after 30 minutes. Every
+running worker instance must receive a distinct `OCR_CONSUMER_NAME` from its
+deployment configuration.
+
+The external producer must commit `payment_id='queued'` before publishing,
+publish one stream entry per ticket with the exact field names above, and keep
+`pdfUrl` publicly readable until Azure finishes. Stream retention remains the
+producer/Redis deployment's responsibility; this worker acknowledges terminal
+failures but does not delete entries, retry OCR, or publish to a dead-letter
+stream.
 
 Every JWT role with a non-empty `roles` claim can view and decide receipts, as
 requested. The frontend does not replace backend authorization.
@@ -274,6 +327,17 @@ Required backend environment variables:
 ```text
 DATABASE_URL
 JWT_PRIVATE_KEY                # RSA PEM; literal \n is accepted in an env value
+```
+
+The standalone OCR worker additionally requires:
+
+```text
+REDIS_HOST
+REDIS_PORT
+REDIS_PASSWORD
+OCR_CONSUMER_NAME
+DOCUMENT_INTELLIGENCE_ENDPOINT
+DOCUMENT_INTELLIGENCE_API_KEY
 ```
 
 For local development and Docker Compose, put these values in
@@ -360,10 +424,8 @@ Checks:
 
 ```bash
 cd backend
-node --check src/index.js
-node --check src/routes/receipt-upload.js
-node --check src/routes/receipt-review.js
-node --check src/utils/azureBlobStorage.js
+npm test
+npm run worker:ocr                  # requires live worker configuration
 
 cd ../frontend
 npm run build

@@ -10,5 +10,6 @@ const pool = new Pool({
 module.exports = {
   // we just export two functions: query for simple queries, getClient for transactions
   query: (text, params) => pool.query(text, params),
-  getClient: () => pool.connect() 
+  getClient: () => pool.connect(),
+  end: () => pool.end(),
 };
