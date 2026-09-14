@@ -204,7 +204,6 @@ account in `verification`.
 ```text
 GET   /receipt-review/volunteers/me
 GET   /receipt-review/submissions
-GET   /receipt-review/submissions/:ticketId
 PATCH /receipt-review/submissions/:ticketId/payment-id
 PATCH /receipt-review/submissions/:ticketId/decision
 GET   /receipt-review/conflicts

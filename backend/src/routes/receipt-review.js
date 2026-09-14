@@ -162,7 +162,7 @@ router.get('/submissions', requireRegisteredVolunteer, async (req, res) => {
     const pageSize = getPageValue(req.query.page_size, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
     const offset = (page - 1) * pageSize;
 
-    const countResult = await db.query(
+    const countPromise = db.query(
       `SELECT COUNT(*)::int AS total
        FROM public.ticket_payments tp
        JOIN public.users u ON u.user_id = tp.user_id
@@ -173,193 +173,37 @@ router.get('/submissions', requireRegisteredVolunteer, async (req, res) => {
     const dataParams = [...params, pageSize, offset];
     const limitParameter = `$${dataParams.length - 1}`;
     const offsetParameter = `$${dataParams.length}`;
-    const dataResult = await db.query(
-      `SELECT
-         tp.ticket_id,
-         tp.user_id,
-         tp.ticket_type,
-         tp.amount_paid,
-         tp.s3_url,
-         tp.status,
-         tp.email_sent,
-         tp.created_at,
-         tp.updated_at,
-         u.email AS participant_email,
-         u.phone AS participant_phone,
-         u.name AS participant_name,
-         u.gender AS participant_gender,
-         u.college_name AS participant_college_name,
-         u.year_of_study AS participant_year_of_study,
-         (
-           SELECT jsonb_build_object(
-             'team_id', hr.team_id,
-             'team_name', hr.team_name,
-             'domain', hr.domain,
-             'track', hr.track,
-             'ps_description', hr.ps_description
-           )
-           FROM public.hackathon_regs hr
-           WHERE hr.ticket_id = tp.ticket_id
-           ORDER BY hr.created_at, hr.team_id
-           LIMIT 1
-         ) AS hackathon,
-         COALESCE((
-           SELECT jsonb_agg(
-             jsonb_build_object(
-               'event_id', e.event_id,
-               'date', e.date,
-               'name', e.name,
-               'dept_name', e.dept_name,
-               'event_type', e.event_type
-             ) ORDER BY e.date, e.name
-           )
-           FROM public.ticket_event te
-           JOIN public.events e ON e.event_id = te.event_id
-           WHERE te.ticket_id = tp.ticket_id
-         ), '[]'::jsonb) AS events
-       FROM public.ticket_payments tp
-       JOIN public.users u ON u.user_id = tp.user_id
-       ${whereClause}
-       ORDER BY tp.created_at DESC, tp.ticket_id DESC
-       LIMIT ${limitParameter} OFFSET ${offsetParameter}`,
-      dataParams,
-    );
+    const [countResult, dataResult] = await Promise.all([
+      countPromise,
+      db.query(
+        `SELECT tp.ticket_id
+         FROM public.ticket_payments tp
+         JOIN public.users u ON u.user_id = tp.user_id
+         ${whereClause}
+         ORDER BY tp.created_at DESC, tp.ticket_id DESC
+         LIMIT ${limitParameter} OFFSET ${offsetParameter}`,
+        dataParams,
+      ),
+    ]);
+
+    // Fetch the complete review payload for the page in set-based queries.
+    // This keeps the list endpoint ready for review without N per-ticket
+    // detail requests from the client.
+    const ticketIds = dataResult.rows.map(row => row.ticket_id);
+    const summaries = await loadReviewSummaries(db, ticketIds);
+    const items = ticketIds.map(ticketId => summaries.get(ticketId)).filter(Boolean);
 
     const total = countResult.rows[0]?.total || 0;
     return res.json({
-      items: dataResult.rows,
+      items,
+      registered: true,
+      volunteer: req.verificationVolunteer,
       pagination: {
         page,
         page_size: pageSize,
         total,
         total_pages: total === 0 ? 0 : Math.ceil(total / pageSize),
       },
-    });
-  } catch (error) {
-    return sendDatabaseError(res, error);
-  }
-});
-
-router.get('/submissions/:ticketId', requireRegisteredVolunteer, async (req, res) => {
-  const { ticketId } = req.params;
-  if (!isUuid(ticketId)) {
-    return res.status(400).json({ error: 'ticket ID must be a valid UUID' });
-  }
-
-  try {
-    const paymentResult = await db.query(
-      `SELECT
-         tp.ticket_id,
-         tp.user_id,
-         tp.ticket_type,
-         tp.amount_paid,
-         tp.s3_url,
-         tp.payment_id,
-         tp.status,
-         tp.email_sent,
-         tp.created_at,
-         tp.updated_at,
-         u.email AS participant_email,
-         u.phone AS participant_phone,
-         u.name AS participant_name,
-         u.gender AS participant_gender,
-         u.college_name AS participant_college_name,
-         u.year_of_study AS participant_year_of_study,
-         (
-           SELECT jsonb_build_object(
-             'team_id', hr.team_id,
-             'team_name', hr.team_name,
-             'domain', hr.domain,
-             'track', hr.track,
-             'ps_description', hr.ps_description
-           )
-           FROM public.hackathon_regs hr
-           WHERE hr.ticket_id = tp.ticket_id
-           ORDER BY hr.created_at, hr.team_id
-           LIMIT 1
-         ) AS hackathon,
-         COALESCE((
-           SELECT jsonb_agg(
-             jsonb_build_object(
-               'event_id', e.event_id,
-               'date', e.date,
-               'name', e.name,
-               'dept_name', e.dept_name,
-               'event_type', e.event_type,
-               'attendance', te.attendance,
-               'attendance_timestamp', te.attendance_timestamp
-             ) ORDER BY e.date, e.name
-           )
-           FROM public.ticket_event te
-           JOIN public.events e ON e.event_id = te.event_id
-           WHERE te.ticket_id = tp.ticket_id
-         ), '[]'::jsonb) AS events
-       FROM public.ticket_payments tp
-       JOIN public.users u ON u.user_id = tp.user_id
-       WHERE tp.ticket_id = $1`,
-      [ticketId],
-    );
-
-    if (paymentResult.rows.length === 0) {
-      return res.status(404).json({ error: 'ticket payment not found' });
-    }
-
-    const [membersResult, logsResult] = await Promise.all([
-      db.query(
-        `SELECT
-           hm.member_id,
-           hm.team_id,
-           hm.is_lead,
-           hm.name,
-           hm.email,
-           hm.phno,
-           hm.year_of_study,
-           hm.created_at,
-           hm.updated_at
-         FROM public.hackathon_members hm
-         JOIN public.hackathon_regs hr ON hr.team_id = hm.team_id
-         WHERE hr.ticket_id = $1
-         ORDER BY hm.is_lead DESC, hm.created_at, hm.member_id`,
-        [ticketId],
-      ),
-      db.query(
-        `SELECT
-           pvl.log_id,
-           pvl.ticket_id,
-           pvl.volunteer_id,
-           pvl.action_taken,
-           pvl.verif_time,
-           pvl.created_at,
-           pvl.updated_at,
-           v.email AS volunteer_email,
-           v.name AS volunteer_name,
-           v.dept AS volunteer_dept
-         FROM public.payment_verification_log pvl
-         JOIN public.verification v ON v.volunteer_id = pvl.volunteer_id
-         WHERE pvl.ticket_id = $1
-         ORDER BY pvl.verif_time DESC, pvl.log_id DESC`,
-        [ticketId],
-      ),
-    ]);
-
-    const payment = paymentResult.rows[0];
-    let conflict = null;
-    if (isPaymentId(payment.payment_id)) {
-      const conflictCandidates = await findConflictCandidates(db, payment.payment_id);
-      if (conflictCandidates.length > 1) {
-        conflict = buildConflictMetadata(conflictCandidates, payment.payment_id);
-      }
-    }
-    return res.json({
-      submission: {
-        ...payment,
-        hackathon: payment.hackathon
-          ? { ...payment.hackathon, members: membersResult.rows }
-          : null,
-        verification_logs: logsResult.rows,
-        conflict,
-      },
-      conflict,
     });
   } catch (error) {
     return sendDatabaseError(res, error);
@@ -538,67 +382,62 @@ async function findConflictCandidates(executor, paymentId, forUpdate = false) {
   return result.rows;
 }
 
-async function loadReviewSummary(executor, ticketId) {
-  const paymentResult = await executor.query(
-    `SELECT
-       tp.ticket_id,
-       tp.user_id,
-       tp.ticket_type,
-       tp.amount_paid,
-       tp.s3_url,
-       tp.payment_id,
-       tp.status,
-       tp.email_sent,
-       tp.created_at,
-       tp.updated_at,
-       u.email AS participant_email,
-       u.phone AS participant_phone,
-       u.name AS participant_name,
-       u.gender AS participant_gender,
-       u.college_name AS participant_college_name,
-       u.year_of_study AS participant_year_of_study,
-       (
-         SELECT jsonb_build_object(
-           'team_id', hr.team_id,
-           'team_name', hr.team_name,
-           'domain', hr.domain,
-           'track', hr.track,
-           'ps_description', hr.ps_description
-         )
-         FROM public.hackathon_regs hr
-         WHERE hr.ticket_id = tp.ticket_id
-         ORDER BY hr.created_at, hr.team_id
-         LIMIT 1
-       ) AS hackathon,
-       COALESCE((
-         SELECT jsonb_agg(
-           jsonb_build_object(
-             'event_id', e.event_id,
-             'date', e.date,
-             'name', e.name,
-             'dept_name', e.dept_name,
-             'event_type', e.event_type,
-             'attendance', te.attendance,
-             'attendance_timestamp', te.attendance_timestamp
-           ) ORDER BY e.date, e.name
-         )
-         FROM public.ticket_event te
-         JOIN public.events e ON e.event_id = te.event_id
-         WHERE te.ticket_id = tp.ticket_id
-       ), '[]'::jsonb) AS events
-     FROM public.ticket_payments tp
-     JOIN public.users u ON u.user_id = tp.user_id
-     WHERE tp.ticket_id = $1`,
-    [ticketId],
-  );
+/**
+ * Load review-ready summaries for a set of tickets. Every child collection is
+ * fetched with one ANY query, so this function is safe for a paginated page
+ * and for a multi-candidate conflict detail view.
+ */
+async function loadReviewSummaries(executor, ticketIds, options = {}) {
+  const ids = [...new Set((Array.isArray(ticketIds) ? ticketIds : []).filter(isUuid))];
+  if (ids.length === 0) return new Map();
 
-  if (paymentResult.rows.length === 0) return null;
-
-  const [membersResult, logsResult] = await Promise.all([
+  const [paymentResult, eventsResult, hackathonResult, logsResult] = await Promise.all([
     executor.query(
       `SELECT
+         tp.ticket_id,
+         tp.user_id,
+         tp.ticket_type,
+         tp.amount_paid,
+         tp.s3_url,
+         tp.payment_id,
+         tp.status,
+         tp.email_sent,
+         tp.created_at,
+         tp.updated_at,
+         u.email AS participant_email,
+         u.phone AS participant_phone,
+         u.name AS participant_name,
+         u.gender AS participant_gender,
+         u.college_name AS participant_college_name,
+         u.year_of_study AS participant_year_of_study
+       FROM public.ticket_payments tp
+       JOIN public.users u ON u.user_id = tp.user_id
+       WHERE tp.ticket_id = ANY($1::uuid[])`,
+      [ids],
+    ),
+    executor.query(
+      `SELECT
+         te.ticket_id,
+         e.event_id,
+         e.date,
+         e.name,
+         e.dept_name,
+         e.event_type
+       FROM public.ticket_event te
+       JOIN public.events e ON e.event_id = te.event_id
+       WHERE te.ticket_id = ANY($1::uuid[])
+       ORDER BY te.ticket_id, e.date, e.name`,
+      [ids],
+    ),
+    executor.query(
+      `SELECT
+         ranked_hr.ticket_id,
+         ranked_hr.team_id,
+         ranked_hr.team_name,
+         ranked_hr.domain,
+         ranked_hr.track,
+         ranked_hr.ps_description,
          hm.member_id,
-         hm.team_id,
          hm.is_lead,
          hm.name,
          hm.email,
@@ -606,11 +445,25 @@ async function loadReviewSummary(executor, ticketId) {
          hm.year_of_study,
          hm.created_at,
          hm.updated_at
-       FROM public.hackathon_members hm
-       JOIN public.hackathon_regs hr ON hr.team_id = hm.team_id
-       WHERE hr.ticket_id = $1
-       ORDER BY hm.is_lead DESC, hm.created_at, hm.member_id`,
-      [ticketId],
+       FROM (
+         SELECT
+           hr.ticket_id,
+           hr.team_id,
+           hr.team_name,
+           hr.domain,
+           hr.track,
+           hr.ps_description,
+           ROW_NUMBER() OVER (
+             PARTITION BY hr.ticket_id
+             ORDER BY hr.created_at, hr.team_id
+           ) AS registration_rank
+         FROM public.hackathon_regs hr
+         WHERE hr.ticket_id = ANY($1::uuid[])
+       ) ranked_hr
+       LEFT JOIN public.hackathon_members hm ON hm.team_id = ranked_hr.team_id
+       WHERE ranked_hr.registration_rank = 1
+       ORDER BY ranked_hr.ticket_id, hm.is_lead DESC NULLS LAST, hm.created_at, hm.member_id`,
+      [ids],
     ),
     executor.query(
       `SELECT
@@ -626,23 +479,110 @@ async function loadReviewSummary(executor, ticketId) {
          v.dept AS volunteer_dept
        FROM public.payment_verification_log pvl
        JOIN public.verification v ON v.volunteer_id = pvl.volunteer_id
-       WHERE pvl.ticket_id = $1
-       ORDER BY pvl.verif_time DESC, pvl.log_id DESC`,
-      [ticketId],
+       WHERE pvl.ticket_id = ANY($1::uuid[])
+       ORDER BY pvl.ticket_id, pvl.verif_time DESC, pvl.log_id DESC`,
+      [ids],
     ),
   ]);
 
-  const payment = paymentResult.rows[0];
-  return {
+  const eventsByTicket = new Map();
+  for (const event of eventsResult.rows) {
+    const events = eventsByTicket.get(event.ticket_id) || [];
+    const {
+      ticket_id: ignoredTicketId,
+      ...eventPayload
+    } = event;
+    events.push(eventPayload);
+    eventsByTicket.set(ignoredTicketId, events);
+  }
+
+  const hackathonsByTicket = new Map();
+  const membersByTicket = new Map();
+  for (const row of hackathonResult.rows) {
+    if (!hackathonsByTicket.has(row.ticket_id)) {
+      hackathonsByTicket.set(row.ticket_id, {
+        team_id: row.team_id,
+        team_name: row.team_name,
+        domain: row.domain,
+        track: row.track,
+        ps_description: row.ps_description,
+      });
+    }
+    if (row.member_id !== null && row.member_id !== undefined) {
+      const members = membersByTicket.get(row.ticket_id) || [];
+      members.push({
+        member_id: row.member_id,
+        team_id: row.team_id,
+        is_lead: row.is_lead,
+        name: row.name,
+        email: row.email,
+        phno: row.phno,
+        year_of_study: row.year_of_study,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      });
+      membersByTicket.set(row.ticket_id, members);
+    }
+  }
+  const logsByTicket = new Map();
+  for (const log of logsResult.rows) {
+    const logs = logsByTicket.get(log.ticket_id) || [];
+    logs.push(log);
+    logsByTicket.set(log.ticket_id, logs);
+  }
+
+  const payments = paymentResult.rows.map(payment => ({
     ...payment,
-    // Keep s3_url as the persisted field while exposing an explicit PDF name
-    // for conflict-review clients.
-    receipt_pdf_url: payment.s3_url,
-    hackathon: payment.hackathon
-      ? { ...payment.hackathon, members: membersResult.rows }
+    events: eventsByTicket.get(payment.ticket_id) || [],
+    hackathon: hackathonsByTicket.has(payment.ticket_id)
+      ? {
+        ...hackathonsByTicket.get(payment.ticket_id),
+        members: membersByTicket.get(payment.ticket_id) || [],
+      }
       : null,
-    verification_logs: logsResult.rows,
-  };
+    verification_logs: logsByTicket.get(payment.ticket_id) || [],
+  }));
+
+  let conflictsByPayment = new Map();
+  if (options.includeConflicts !== false) {
+    conflictsByPayment = await loadConflictMetadata(executor, payments.map(payment => payment.payment_id));
+  }
+
+  return new Map(payments.map(payment => [
+    payment.ticket_id,
+    { ...payment, conflict: conflictsByPayment.get(payment.payment_id) || null },
+  ]));
+}
+
+async function loadConflictMetadata(executor, paymentIds) {
+  const ids = [...new Set((Array.isArray(paymentIds) ? paymentIds : []).filter(isPaymentId))];
+  if (ids.length === 0) return new Map();
+
+  const result = await executor.query(
+    `SELECT
+       tp.ticket_id,
+       tp.payment_id,
+       tp.status,
+       tp.s3_url
+     FROM public.ticket_payments tp
+     WHERE tp.payment_id = ANY($1::text[])
+     ORDER BY tp.payment_id, tp.created_at, tp.ticket_id`,
+    [ids],
+  );
+  const candidatesByPayment = new Map();
+  for (const candidate of result.rows) {
+    const candidates = candidatesByPayment.get(candidate.payment_id) || [];
+    candidates.push(candidate);
+    candidatesByPayment.set(candidate.payment_id, candidates);
+  }
+
+  const metadataByPayment = new Map();
+  for (const [paymentId, candidates] of candidatesByPayment) {
+    if (candidates.length > 1) {
+      metadataByPayment.set(paymentId, buildConflictMetadata(candidates, paymentId));
+    }
+  }
+  return metadataByPayment;
 }
 
 async function resolvePaymentConflict(client, paymentId, winnerTicketId, volunteerId) {
@@ -910,24 +850,18 @@ router.get('/conflicts/:paymentId', requireRegisteredVolunteer, async (req, res)
       });
     }
 
-    const summaries = await Promise.all(
-      candidates.map(async candidate => (
-        (await loadReviewSummary(db, candidate.ticket_id)) || {
-          ...candidate,
-          receipt_pdf_url: candidate.s3_url,
-          hackathon: null,
-          verification_logs: [],
-        }
-      )),
+    const summariesByTicket = await loadReviewSummaries(
+      db,
+      candidates.map(candidate => candidate.ticket_id),
+      { includeConflicts: false },
     );
-    const metadata = buildConflictMetadata(candidates, paymentId);
-    const conflictPayload = { ...metadata, candidates: summaries };
-    return res.json({
-      payment_id: paymentId,
-      conflict: conflictPayload,
-      metadata,
-      candidates: summaries,
+    const summaries = candidates.map(candidate => summariesByTicket.get(candidate.ticket_id) || {
+      ...candidate,
+      hackathon: null,
+      verification_logs: [],
     });
+    const metadata = buildConflictMetadata(candidates, paymentId);
+    return res.json({ ...metadata, candidates: summaries });
   } catch (error) {
     if (error.httpStatus) return sendDatabaseError(res, error);
     return sendDatabaseError(res, error);
@@ -1067,6 +1001,7 @@ module.exports._test = {
   buildConflictSearch,
   buildConflictMetadata,
   findConflictCandidates,
-  loadReviewSummary,
+  loadReviewSummaries,
+  loadConflictMetadata,
   resolvePaymentConflict,
 };

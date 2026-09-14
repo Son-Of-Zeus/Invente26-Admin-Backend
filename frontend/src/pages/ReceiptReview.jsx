@@ -1,9 +1,24 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "../hooks/useAuth";
 
 const PAYMENT_STATUSES = ["PendingPayment", "NotVerified", "Accepted", "Rejected"];
 const PAGE_SIZE = 25;
 const PAYMENT_ID_PATTERN = /^pay_[A-Za-z0-9]{14}$/;
+let submissionsRequestInFlight = null;
+
+function loadSubmissionsOnce(authAxios, params) {
+  const key = JSON.stringify(params);
+  if (submissionsRequestInFlight?.client === authAxios && submissionsRequestInFlight.key === key) {
+    return submissionsRequestInFlight.promise;
+  }
+
+  const promise = authAxios.get("/receipt-review/submissions", { params });
+  submissionsRequestInFlight = { client: authAxios, key, promise };
+  promise.finally(() => {
+    if (submissionsRequestInFlight?.promise === promise) submissionsRequestInFlight = null;
+  }).catch(() => {});
+  return promise;
+}
 
 function getErrorMessage(error, fallback = "Something went wrong") {
   return error?.response?.data?.error || error?.message || fallback;
@@ -58,6 +73,26 @@ function getCandidateTicketId(candidate) {
 function getCandidateReceiptUrl(candidate) {
   const submission = getCandidateSubmission(candidate);
   return candidate?.s3_url || candidate?.receipt_pdf_url || submission.s3_url || submission.receipt_pdf_url || "";
+}
+
+function appendVerificationLog(logs, log) {
+  if (!log) return logs || [];
+  if ((logs || []).some((existingLog) => log.log_id && existingLog.log_id === log.log_id)) return logs;
+  return [log, ...(logs || [])];
+}
+
+function mergePaymentUpdate(record, payment, logs = []) {
+  const nextRecord = { ...record, ...(payment || {}) };
+  const nestedKey = record?.submission ? "submission" : record?.payment ? "payment" : null;
+  if (nestedKey) {
+    nextRecord[nestedKey] = {
+      ...record[nestedKey],
+      ...(payment || {}),
+      verification_logs: logs.reduce((candidate, log) => appendVerificationLog(candidate, log), record[nestedKey].verification_logs || []),
+    };
+  }
+  nextRecord.verification_logs = logs.reduce((candidate, log) => appendVerificationLog(candidate, log), record?.verification_logs || []);
+  return nextRecord;
 }
 
 function Pagination({ pagination, page, loading, onPageChange, noun = "items" }) {
@@ -134,14 +169,11 @@ function ReceiptReviewPage() {
   const [items, setItems] = useState([]);
   const [pagination, setPagination] = useState({ page: 1, page_size: PAGE_SIZE, total: 0, total_pages: 0 });
   const [selectedId, setSelectedId] = useState(null);
-  const [detail, setDetail] = useState(null);
   const [listLoading, setListLoading] = useState(false);
-  const [detailLoading, setDetailLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [paymentIdLoading, setPaymentIdLoading] = useState(false);
   const [manualPaymentId, setManualPaymentId] = useState("");
   const [manualEntryError, setManualEntryError] = useState(null);
-  const [refreshVersion, setRefreshVersion] = useState(0);
   const [conflictFilter, setConflictFilter] = useState("unresolved");
   const [conflictSearch, setConflictSearch] = useState("");
   const [debouncedConflictSearch, setDebouncedConflictSearch] = useState("");
@@ -158,24 +190,55 @@ function ReceiptReviewPage() {
   const [conflictActionLoading, setConflictActionLoading] = useState(false);
   const [error, setError] = useState(null);
   const [message, setMessage] = useState(null);
+  const registrationKnownRef = useRef(false);
+  const registrationDeniedRef = useRef(false);
+  const conflictListKeyRef = useRef(null);
+  const conflictRefreshSeenRef = useRef(0);
 
   useEffect(() => { const timer = setTimeout(() => setDebouncedSearch(search.trim()), 350); return () => clearTimeout(timer); }, [search]);
   useEffect(() => { const timer = setTimeout(() => setDebouncedConflictSearch(conflictSearch.trim()), 350); return () => clearTimeout(timer); }, [conflictSearch]);
 
   useEffect(() => {
+    if (registrationDeniedRef.current) return undefined;
     let active = true;
-    async function loadRegistration() { setRegistrationLoading(true); try { const response = await authAxios.get("/receipt-review/volunteers/me"); if (active) setRegistration(response.data); } catch (requestError) { if (active) setError(getErrorMessage(requestError, "Could not check volunteer signup")); } finally { if (active) setRegistrationLoading(false); } }
-    loadRegistration();
-    return () => { active = false; };
-  }, [authAxios]);
-
-  useEffect(() => {
-    if (!registration?.registered || tab !== "payments") return undefined;
-    let active = true;
-    async function loadSubmissions() { setListLoading(true); setError(null); try { const response = await authAxios.get("/receipt-review/submissions", { params: { status: statusFilter === "all" ? undefined : statusFilter, ticket_type: ticketTypeFilter === "all" ? undefined : ticketTypeFilter, search: debouncedSearch || undefined, page, page_size: PAGE_SIZE } }); if (active) { setItems(response.data.items || []); setPagination(response.data.pagination || { page, page_size: PAGE_SIZE, total: 0, total_pages: 0 }); } } catch (requestError) { if (active) setError(getErrorMessage(requestError, "Could not load receipt submissions")); } finally { if (active) setListLoading(false); } }
+    const initialLoad = !registrationKnownRef.current;
+    async function loadSubmissions() {
+      setListLoading(true);
+      if (initialLoad) setRegistrationLoading(true);
+      setError(null);
+      try {
+        const response = await loadSubmissionsOnce(authAxios, { status: statusFilter === "all" ? undefined : statusFilter, ticket_type: ticketTypeFilter === "all" ? undefined : ticketTypeFilter, search: debouncedSearch || undefined, page, page_size: PAGE_SIZE });
+        const data = response.data || {};
+        if (active) {
+          registrationKnownRef.current = true;
+          registrationDeniedRef.current = data.registered === false;
+          setRegistration({ registered: data.registered !== false, volunteer: data.volunteer || null });
+          setItems(data.items || []);
+          setPagination(data.pagination || { page, page_size: PAGE_SIZE, total: 0, total_pages: 0 });
+        }
+      } catch (requestError) {
+        if (active) {
+          registrationKnownRef.current = true;
+          if (requestError?.response?.status === 403) {
+            registrationDeniedRef.current = true;
+            setRegistration({ registered: false, volunteer: null });
+            setItems([]);
+            setPagination({ page: 1, page_size: PAGE_SIZE, total: 0, total_pages: 0 });
+          } else {
+            setRegistration((current) => current || { registered: true, volunteer: null });
+            setError(getErrorMessage(requestError, "Could not load receipt submissions"));
+          }
+        }
+      } finally {
+        if (active) {
+          setListLoading(false);
+          if (initialLoad) setRegistrationLoading(false);
+        }
+      }
+    }
     loadSubmissions();
     return () => { active = false; };
-  }, [authAxios, debouncedSearch, page, refreshVersion, registration, statusFilter, tab, ticketTypeFilter]);
+  }, [authAxios, debouncedSearch, page, statusFilter, ticketTypeFilter]);
 
   const loadConflictGroups = useCallback(async () => {
     setConflictListLoading(true); setError(null);
@@ -185,28 +248,28 @@ function ReceiptReviewPage() {
   useEffect(() => {
     if (!registration?.registered || tab !== "conflicts") return undefined;
     let active = true;
-    loadConflictGroups();
+    const queryKey = `${conflictFilter}|${debouncedConflictSearch}|${conflictPage}`;
+    const refreshRequested = conflictRefreshSeenRef.current !== conflictRefreshVersion;
+    if (conflictListKeyRef.current !== queryKey || refreshRequested) {
+      conflictListKeyRef.current = queryKey;
+      conflictRefreshSeenRef.current = conflictRefreshVersion;
+      loadConflictGroups();
+    }
     const timer = setInterval(() => { if (active) loadConflictGroups(); }, 30000);
     return () => { active = false; clearInterval(timer); };
-  }, [conflictRefreshVersion, loadConflictGroups, registration, tab]);
+  }, [conflictFilter, conflictPage, conflictRefreshVersion, debouncedConflictSearch, loadConflictGroups, registration, registration?.registered, tab]);
 
   useEffect(() => { setManualPaymentId(""); setManualEntryError(null); }, [selectedId]);
 
   useEffect(() => {
-    if (!registration?.registered || !selectedId || tab !== "payments") { setDetail(null); return undefined; }
+    if (!registration?.registered || !selectedConflictPaymentId || conflictDetail?.payment_id === selectedConflictPaymentId) return undefined;
     let active = true;
-    async function loadDetail() { setDetailLoading(true); try { const response = await authAxios.get(`/receipt-review/submissions/${selectedId}`); if (active) setDetail(response.data.submission || null); } catch (requestError) { if (active) setError(getErrorMessage(requestError, "Could not load receipt details")); } finally { if (active) setDetailLoading(false); } }
-    loadDetail();
-    return () => { active = false; };
-  }, [authAxios, refreshVersion, registration, selectedId, tab]);
-
-  useEffect(() => {
-    if (!registration?.registered || !selectedConflictPaymentId || tab !== "conflicts") { setConflictDetail(null); return undefined; }
-    let active = true;
-    async function loadConflictDetail() { setConflictDetailLoading(true); setError(null); try { const response = await authAxios.get(`/receipt-review/conflicts/${encodeURIComponent(selectedConflictPaymentId)}`); const data = response.data || {}; const mergedConflict = { ...(data.conflict || {}), ...data, candidates: data.candidates || data.conflict?.candidates || [] }; if (active) { setConflictDetail(mergedConflict); if (mergedConflict.blocked && mergedConflict.blocked_reason) setError(`Conflict resolution blocked: ${String(mergedConflict.blocked_reason).replaceAll("_", " ")}`); } } catch (requestError) { if (active) setError(getErrorMessage(requestError, "Could not load conflict details")); } finally { if (active) setConflictDetailLoading(false); } }
+    async function loadConflictDetail() { setConflictDetailLoading(true); setError(null); try { const response = await authAxios.get(`/receipt-review/conflicts/${encodeURIComponent(selectedConflictPaymentId)}`); const data = response.data || {}; const mergedConflict = { ...(data.conflict || {}), ...data, payment_id: data.payment_id || data.conflict?.payment_id || selectedConflictPaymentId, candidates: data.candidates || data.conflict?.candidates || [] }; if (active) { setConflictDetail(mergedConflict); if (mergedConflict.blocked && mergedConflict.blocked_reason) setError(`Conflict resolution blocked: ${String(mergedConflict.blocked_reason).replaceAll("_", " ")}`); } } catch (requestError) { if (active) { if (requestError?.response?.status === 403) setRegistration({ registered: false, volunteer: null }); setError(getErrorMessage(requestError, "Could not load conflict details")); } } finally { if (active) setConflictDetailLoading(false); } }
     loadConflictDetail();
     return () => { active = false; };
-  }, [authAxios, conflictRefreshVersion, registration, selectedConflictPaymentId, tab]);
+  }, [authAxios, conflictDetail, registration, selectedConflictPaymentId]);
+
+  const detail = useMemo(() => items.find((item) => item.ticket_id === selectedId) || null, [items, selectedId]);
 
   const conflictCandidates = useMemo(() => conflictDetail?.candidates || [], [conflictDetail]);
   const acceptedCandidate = useMemo(() => conflictCandidates.find((candidate) => (getCandidateSubmission(candidate).status || candidate.status) === "Accepted"), [conflictCandidates]);
@@ -216,18 +279,40 @@ function ReceiptReviewPage() {
   const conflictResolutionAllowed = conflictDetail?.resolution_allowed !== false && conflictDetail?.blocked !== true && !conflictResolved && !hasMissingReceipt;
   useEffect(() => { setConflictWinnerId(acceptedTicketId || null); }, [acceptedTicketId, selectedConflictPaymentId]);
 
-  function openConflictGroup(paymentId) { if (!paymentId) return; setTab("conflicts"); setConflictFilter("unresolved"); setSelectedConflictPaymentId(paymentId); setMessage("This payment belongs to a conflict group. Resolve the group before deciding an individual payment."); }
+  function selectConflictGroup(paymentId) {
+    setSelectedConflictPaymentId(paymentId);
+    setConflictDetail((current) => current?.payment_id === paymentId ? current : null);
+  }
+
+  function openConflictGroup(paymentId) { if (!paymentId) return; setTab("conflicts"); setConflictFilter("unresolved"); selectConflictGroup(paymentId); setMessage("This payment belongs to a conflict group. Resolve the group before deciding an individual payment."); }
 
   async function decide(status) {
     if (!selectedId || detail?.status !== "NotVerified" || detail?.conflict_review_required) return;
     setActionLoading(true); setError(null); setMessage(null);
-    try { await authAxios.patch(`/receipt-review/submissions/${selectedId}/decision`, { status }); setMessage(`Payment marked ${status}.`); setRefreshVersion((current) => current + 1); } catch (requestError) { const responseData = requestError?.response?.data || {}; if (responseData.code === "CONFLICT_REVIEW_REQUIRED") openConflictGroup(responseData.payment_id || detail.payment_id); else { const currentStatus = responseData.current_status; setError(currentStatus ? `${getErrorMessage(requestError)} Current status: ${currentStatus}.` : getErrorMessage(requestError, "Could not save the receipt decision")); } } finally { setActionLoading(false); }
+    try {
+      const response = await authAxios.patch(`/receipt-review/submissions/${selectedId}/decision`, { status });
+      const responseData = response.data || {};
+      const payment = responseData.payment || { ticket_id: selectedId, status };
+      const log = responseData.log;
+      setItems((currentItems) => currentItems.map((item) => item.ticket_id === (payment.ticket_id || selectedId) ? mergePaymentUpdate(item, payment, log ? [log] : []) : item));
+      setMessage(`Payment marked ${status}.`);
+    } catch (requestError) {
+      const responseData = requestError?.response?.data || {};
+      if (responseData.code === "CONFLICT_REVIEW_REQUIRED") openConflictGroup(responseData.payment_id || detail.payment_id);
+      else { const currentStatus = responseData.current_status; setError(currentStatus ? `${getErrorMessage(requestError)} Current status: ${currentStatus}.` : getErrorMessage(requestError, "Could not save the receipt decision")); }
+    } finally { setActionLoading(false); }
   }
 
   async function savePaymentId() {
     if (!selectedId || detail?.payment_id !== "queued") return;
     setPaymentIdLoading(true); setManualEntryError(null); setMessage(null);
-    try { await authAxios.patch(`/receipt-review/submissions/${selectedId}/payment-id`, { payment_id: manualPaymentId }); setManualPaymentId(""); setMessage("Payment ID saved."); setRefreshVersion((current) => current + 1); } catch (requestError) { setManualEntryError(getErrorMessage(requestError, "Could not save the payment ID")); if (requestError?.response?.status === 409) setRefreshVersion((current) => current + 1); } finally { setPaymentIdLoading(false); }
+    try {
+      const response = await authAxios.patch(`/receipt-review/submissions/${selectedId}/payment-id`, { payment_id: manualPaymentId });
+      const payment = response.data?.payment || { ticket_id: selectedId, payment_id: manualPaymentId };
+      setItems((currentItems) => currentItems.map((item) => item.ticket_id === (payment.ticket_id || selectedId) ? mergePaymentUpdate(item, payment) : item));
+      setManualPaymentId("");
+      setMessage("Payment ID saved.");
+    } catch (requestError) { setManualEntryError(getErrorMessage(requestError, "Could not save the payment ID")); } finally { setPaymentIdLoading(false); }
   }
 
   async function resolveConflict() {
@@ -235,7 +320,23 @@ function ReceiptReviewPage() {
     const winner = conflictCandidates.find((candidate) => getCandidateTicketId(candidate) === conflictWinnerId); const loserCount = conflictCandidates.filter((candidate) => (getCandidateSubmission(candidate).status || candidate.status) === "NotVerified" && getCandidateTicketId(candidate) !== conflictWinnerId).length; const winnerName = getCandidateSubmission(winner)?.participant_name || winner?.participant_name || winner?.ticket_id || conflictWinnerId;
     if (!window.confirm(`Select ${winnerName} as the winner and reject ${loserCount} loser${loserCount === 1 ? "" : "s"}?`)) return;
     setConflictActionLoading(true); setError(null); setMessage(null);
-    try { await authAxios.patch(`/receipt-review/conflicts/${encodeURIComponent(selectedConflictPaymentId)}/decision`, { winner_ticket_id: conflictWinnerId }); setMessage(`Conflict resolved: ${winnerName} selected as winner and ${loserCount} loser${loserCount === 1 ? "" : "s"} rejected.`); setConflictRefreshVersion((current) => current + 1); setRefreshVersion((current) => current + 1); } catch (requestError) { setError(getErrorMessage(requestError, "Could not resolve this payment conflict")); } finally { setConflictActionLoading(false); }
+    try {
+      const response = await authAxios.patch(`/receipt-review/conflicts/${encodeURIComponent(selectedConflictPaymentId)}/decision`, { winner_ticket_id: conflictWinnerId });
+      const responseData = response.data || {};
+      const payments = responseData.payments || [];
+      const logs = responseData.logs || [];
+      const paymentByTicket = new Map(payments.map((payment) => [payment.ticket_id, payment]));
+      const logsByTicket = new Map();
+      logs.forEach((log) => logsByTicket.set(log.ticket_id, [...(logsByTicket.get(log.ticket_id) || []), log]));
+      setItems((currentItems) => currentItems.map((item) => paymentByTicket.has(item.ticket_id) ? mergePaymentUpdate(item, paymentByTicket.get(item.ticket_id), logsByTicket.get(item.ticket_id) || []) : item));
+      setConflictDetail((current) => current ? { ...current, state: "resolved", status: "resolved", candidates: (current.candidates || []).map((candidate) => { const ticketId = getCandidateTicketId(candidate); return paymentByTicket.has(ticketId) ? mergePaymentUpdate(candidate, paymentByTicket.get(ticketId), logsByTicket.get(ticketId) || []) : candidate; }) } : current);
+      setConflictGroups((groups) => conflictFilter === "unresolved" ? groups.filter((group) => (group.payment_id || group.paymentId || group.id || group.conflict_id) !== selectedConflictPaymentId) : groups.map((group) => (group.payment_id || group.paymentId || group.id || group.conflict_id) === selectedConflictPaymentId ? { ...group, state: "resolved", status: "resolved" } : group));
+      if (conflictFilter === "unresolved") {
+        setConflictPagination((current) => ({ ...current, total: Math.max(0, (current.total || 0) - 1), total_pages: Math.max(0, Math.ceil(Math.max(0, (current.total || 0) - 1) / (current.page_size || PAGE_SIZE))) }));
+        setUnresolvedTotal((current) => typeof current === "number" ? Math.max(0, current - 1) : current);
+      }
+      setMessage(`Conflict resolved: ${winnerName} selected as winner and ${loserCount} loser${loserCount === 1 ? "" : "s"} rejected.`);
+    } catch (requestError) { setError(getErrorMessage(requestError, "Could not resolve this payment conflict")); } finally { setConflictActionLoading(false); }
   }
 
   if (registrationLoading) return <div className="mx-auto max-w-7xl p-6 text-gray-600">Checking volunteer signup…</div>;
@@ -297,7 +398,7 @@ function ReceiptReviewPage() {
           )}
           <Pagination pagination={pagination} page={page} loading={listLoading} onPageChange={setPage} noun="submissions" />
         </section>
-        <section className="rounded-lg bg-white p-4 shadow-sm ring-1 ring-gray-900/5">{!selectedId && <p className="py-10 text-center text-sm text-gray-500">Select a payment to view its receipt and events.</p>}{selectedId && detailLoading && <p className="py-10 text-center text-sm text-gray-500">Loading payment details…</p>}{selectedId && !detailLoading && detail && <div><div className="flex flex-col gap-3 border-b pb-4 sm:flex-row sm:items-start sm:justify-between"><div><p className="text-xs uppercase tracking-wide text-gray-500">Ticket ID</p><p className="break-all font-mono text-sm text-gray-900">{detail.ticket_id}</p><p className="mt-2 text-sm text-gray-500">Created {formatDate(detail.created_at)}</p></div><StatusBadge status={detail.status} /></div><ReviewSummary submission={detail} /><div className="mt-6"><h3 className="font-semibold text-gray-900">Receipt PDF</h3><div className="mt-2 rounded border bg-gray-50 p-3"><p className="text-xs font-medium uppercase tracking-wide text-gray-500">Payment ID</p>{hasValidPaymentId && <p className="mt-1 break-all font-mono text-sm text-gray-900">{detail.payment_id}</p>}{detail.payment_id === "queued" && detail.status === "NotVerified" && detail.s3_url && <div className="mt-2 flex flex-col gap-2 sm:flex-row"><input value={manualPaymentId} onChange={(event) => setManualPaymentId(event.target.value)} placeholder="pay_ followed by 14 letters or digits" aria-label="Manual payment ID" className="min-w-0 flex-1 rounded border bg-white p-2 font-mono text-sm" /><button type="button" disabled={paymentIdLoading || !PAYMENT_ID_PATTERN.test(manualPaymentId)} onClick={savePaymentId} className="rounded bg-blue-600 px-4 py-2 font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60">{paymentIdLoading ? "Saving…" : "Save payment ID"}</button></div>}{detail.payment_id === "queued" && (!detail.s3_url || detail.status !== "NotVerified") && <p className="mt-1 text-sm text-amber-700">Payment ID is still queued and cannot be edited in the current state.</p>}{detail.payment_id == null && <p className="mt-1 text-sm text-red-700">Payment ID is not in the queued state and cannot be edited.</p>}{detail.payment_id != null && detail.payment_id !== "queued" && !hasValidPaymentId && <p className="mt-1 text-sm text-red-700">The stored payment ID has an unexpected format and cannot be edited here.</p>}{manualEntryError && <p className="mt-2 text-sm text-red-700">{manualEntryError}</p>}</div><ReceiptPreview submission={detail} showHeading={false} /></div>{requiresConflictReview ? <div className="mt-6 border-t pt-4"><p className="text-sm text-amber-800">This payment is part of a conflict group. Individual accept/reject actions are disabled until the group is reviewed.</p><button type="button" onClick={() => openConflictGroup(matchingConflictPaymentId)} className="mt-3 rounded bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">Open conflict group</button></div> : detail.status === "NotVerified" ? <div className="mt-6 border-t pt-4">{!hasValidPaymentId && <p className="mb-3 text-sm text-amber-700">A valid payment ID is required before this payment can be accepted.</p>}<div className="flex flex-wrap gap-3"><button type="button" disabled={actionLoading || !hasValidPaymentId} onClick={() => decide("Accepted")} className="rounded bg-green-600 px-4 py-2 font-semibold text-white hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-60">{actionLoading ? "Saving…" : "Accept"}</button><button type="button" disabled={actionLoading} onClick={() => decide("Rejected")} className="rounded bg-red-600 px-4 py-2 font-semibold text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60">{actionLoading ? "Saving…" : "Reject"}</button></div></div> : <p className="mt-6 border-t pt-4 text-sm text-gray-500">This payment is no longer awaiting a volunteer decision.</p>}<DecisionHistory logs={detail.verification_logs} /></div>}</section></div>
+        <section className="rounded-lg bg-white p-4 shadow-sm ring-1 ring-gray-900/5">{!selectedId && <p className="py-10 text-center text-sm text-gray-500">Select a payment to view its receipt and events.</p>}{selectedId && detail && <div><div className="flex flex-col gap-3 border-b pb-4 sm:flex-row sm:items-start sm:justify-between"><div><p className="text-xs uppercase tracking-wide text-gray-500">Ticket ID</p><p className="break-all font-mono text-sm text-gray-900">{detail.ticket_id}</p><p className="mt-2 text-sm text-gray-500">Created {formatDate(detail.created_at)}</p></div><StatusBadge status={detail.status} /></div><ReviewSummary submission={detail} /><div className="mt-6"><h3 className="font-semibold text-gray-900">Receipt PDF</h3><div className="mt-2 rounded border bg-gray-50 p-3"><p className="text-xs font-medium uppercase tracking-wide text-gray-500">Payment ID</p>{hasValidPaymentId && <p className="mt-1 break-all font-mono text-sm text-gray-900">{detail.payment_id}</p>}{detail.payment_id === "queued" && detail.status === "NotVerified" && detail.s3_url && <div className="mt-2 flex flex-col gap-2 sm:flex-row"><input value={manualPaymentId} onChange={(event) => setManualPaymentId(event.target.value)} placeholder="pay_ followed by 14 letters or digits" aria-label="Manual payment ID" className="min-w-0 flex-1 rounded border bg-white p-2 font-mono text-sm" /><button type="button" disabled={paymentIdLoading || !PAYMENT_ID_PATTERN.test(manualPaymentId)} onClick={savePaymentId} className="rounded bg-blue-600 px-4 py-2 font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60">{paymentIdLoading ? "Saving…" : "Save payment ID"}</button></div>}{detail.payment_id === "queued" && (!detail.s3_url || detail.status !== "NotVerified") && <p className="mt-1 text-sm text-amber-700">Payment ID is still queued and cannot be edited in the current state.</p>}{detail.payment_id == null && <p className="mt-1 text-sm text-red-700">Payment ID is not in the queued state and cannot be edited.</p>}{detail.payment_id != null && detail.payment_id !== "queued" && !hasValidPaymentId && <p className="mt-1 text-sm text-red-700">The stored payment ID has an unexpected format and cannot be edited here.</p>}{manualEntryError && <p className="mt-2 text-sm text-red-700">{manualEntryError}</p>}</div><ReceiptPreview submission={detail} showHeading={false} /></div>{requiresConflictReview ? <div className="mt-6 border-t pt-4"><p className="text-sm text-amber-800">This payment is part of a conflict group. Individual accept/reject actions are disabled until the group is reviewed.</p><button type="button" onClick={() => openConflictGroup(matchingConflictPaymentId)} className="mt-3 rounded bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">Open conflict group</button></div> : detail.status === "NotVerified" ? <div className="mt-6 border-t pt-4">{!hasValidPaymentId && <p className="mb-3 text-sm text-amber-700">A valid payment ID is required before this payment can be accepted.</p>}<div className="flex flex-wrap gap-3"><button type="button" disabled={actionLoading || !hasValidPaymentId} onClick={() => decide("Accepted")} className="rounded bg-green-600 px-4 py-2 font-semibold text-white hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-60">{actionLoading ? "Saving…" : "Accept"}</button><button type="button" disabled={actionLoading} onClick={() => decide("Rejected")} className="rounded bg-red-600 px-4 py-2 font-semibold text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60">{actionLoading ? "Saving…" : "Reject"}</button></div></div> : <p className="mt-6 border-t pt-4 text-sm text-gray-500">This payment is no longer awaiting a volunteer decision.</p>}<DecisionHistory logs={detail.verification_logs} /></div>}</section></div>
     </> : <>
       <div className="mb-4 rounded-lg bg-white p-4 shadow-sm ring-1 ring-gray-900/5"><div className="flex flex-col gap-3 md:flex-row md:items-end"><label className="flex-1 text-sm font-medium text-gray-700">Search payment ID, ticket, participant, or team<input value={conflictSearch} onChange={(event) => { setConflictSearch(event.target.value); setConflictPage(1); }} placeholder="Search conflict groups…" className="mt-1 w-full rounded border p-2 font-normal" /></label><div className="flex gap-2"><button type="button" onClick={() => { setConflictFilter("unresolved"); setConflictPage(1); }} className={`rounded px-3 py-2 text-sm font-semibold ${conflictFilter === "unresolved" ? "bg-blue-600 text-white" : "border text-gray-700"}`}>Unresolved</button><button type="button" onClick={() => { setConflictFilter("resolved"); setConflictPage(1); }} className={`rounded px-3 py-2 text-sm font-semibold ${conflictFilter === "resolved" ? "bg-blue-600 text-white" : "border text-gray-700"}`}>Resolved history</button><button type="button" disabled={conflictListLoading} onClick={() => setConflictRefreshVersion((current) => current + 1)} className="rounded border px-3 py-2 text-sm font-semibold text-gray-700 disabled:opacity-50">Refresh</button></div></div></div>
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.35fr)]"><section className="rounded-lg bg-white shadow-sm ring-1 ring-gray-900/5"><div className="flex items-center justify-between border-b p-4"><div><h2 className="font-semibold text-gray-900">{conflictFilter === "unresolved" ? "Unresolved conflicts" : "Resolved conflict history"}</h2><p className="text-xs text-gray-500">{conflictPagination.total || 0} group{conflictPagination.total === 1 ? "" : "s"}</p></div>{conflictListLoading && <span className="text-sm text-gray-500">Loading…</span>}</div>{conflictGroups.length === 0 && !conflictListLoading ? <p className="p-6 text-sm text-gray-500">No conflict groups match this filter.</p> : <div className="divide-y divide-gray-100">{conflictGroups.map((group, index) => { const paymentId = group.payment_id || group.paymentId || group.id || group.conflict_id; const candidateCount = group.candidate_count || group.candidates_count || group.candidates?.length; return <button type="button" key={paymentId || index} onClick={() => setSelectedConflictPaymentId(paymentId)} className={`block w-full p-4 text-left hover:bg-blue-50 ${selectedConflictPaymentId === paymentId ? "bg-blue-50" : ""}`}><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="break-all font-mono text-xs text-gray-800">{paymentId || "Unknown payment"}</p><p className="mt-1 text-sm font-medium text-gray-900">{group.participant_name || group.team_name || group.display_name || "Payment conflict"}</p><p className="mt-1 text-xs text-gray-500">{candidateCount || 0} candidate{candidateCount === 1 ? "" : "s"} · Updated {formatDate(group.updated_at || group.created_at)}</p></div><StatusBadge status={group.state || group.status || (conflictFilter === "resolved" ? "Resolved" : "Unresolved")} /></div></button>; })}</div>}<Pagination pagination={conflictPagination} page={conflictPage} loading={conflictListLoading} onPageChange={setConflictPage} noun="groups" /></section>
