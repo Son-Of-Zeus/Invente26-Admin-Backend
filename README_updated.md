@@ -21,7 +21,7 @@ Implemented here:
   one-winner resolution, resolved history, and automatic rival rejection.
 - Transactional `Accepted`/`Rejected` decisions with a verification log.
 - Redis Streams payment OCR worker using Azure Document Intelligence.
-- Indexed exact payment-ID search and guarded manual payment-ID entry.
+- Indexed exact payment-ID search and guarded manual payment-ID entry/correction.
 
 Not implemented in this repository:
 
@@ -248,8 +248,9 @@ row into `payment_verification_log` using the registered volunteer UUID. A
 second concurrent decision receives a conflict after the first transaction
 commits.
 
-An `Accepted` decision additionally requires a valid `payment_id`. While the
-value is exactly `queued`, volunteers can save a strict Razorpay ID through:
+An `Accepted` decision additionally requires a valid `payment_id`. While a
+payment is `NotVerified` and has a receipt URL, volunteers can enter or correct
+a strict Razorpay ID through:
 
 ```text
 PATCH /receipt-review/submissions/:ticketId/payment-id
@@ -263,9 +264,12 @@ Request:
 }
 ```
 
-The write locks the payment row and never overwrites an ID saved by OCR or a
-different volunteer. Exact `pay_` searches use the existing payment-ID B-tree
-index; other search terms retain the general case-insensitive search.
+The write locks the payment row and only updates the same `NotVerified` ticket
+that was read before the transaction, so an edit cannot overwrite a concurrent
+change. If the replacement ID is already assigned to another ticket, the
+request is rejected and the conflicting ticket ID is returned.
+Exact `pay_` searches use the existing payment-ID B-tree index; other search
+terms retain the general case-insensitive search.
 
 ### Payment-ID conflicts
 

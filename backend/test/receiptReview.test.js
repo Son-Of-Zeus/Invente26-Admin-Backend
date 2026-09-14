@@ -58,7 +58,7 @@ test('manual entry locks queued payment and saves through a guarded update', asy
     async query(sql, params) {
       queries.push({ sql, params });
       if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
-      if (/FROM public\.ticket_payments[\s\S]*FOR UPDATE/.test(sql)) {
+      if (/FROM public\.ticket_payments[\s\S]*WHERE ticket_id = \$1/.test(sql)) {
         return {
           rows: [{
             ticket_id: TICKET_ID,
@@ -68,6 +68,7 @@ test('manual entry locks queued payment and saves through a guarded update', asy
           }],
         };
       }
+      if (/WHERE payment_id = \$1/.test(sql)) return { rows: [] };
       return { rows: [{ ticket_id: TICKET_ID, payment_id: PAYMENT_ID }] };
     },
   };
@@ -76,10 +77,40 @@ test('manual entry locks queued payment and saves through a guarded update', asy
 
   assert.equal(result.payment_id, PAYMENT_ID);
   assert.ok(queries.some(query => /FOR UPDATE/.test(query.sql)));
-  assert.ok(queries.some(query => /payment_id = 'queued'/.test(query.sql)));
+  assert.ok(queries.some(query => /payment_id = \$3/.test(query.sql)));
 });
 
-test('manual entry rejects an existing real payment ID', async () => {
+test('manual correction updates an existing NotVerified payment ID', async () => {
+  const replacementPaymentId = 'pay_ZYXWVUTSRQPONM';
+  const queries = [];
+  const client = {
+    async query(sql, params) {
+      queries.push({ sql, params });
+      if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+      if (/FROM public\.ticket_payments[\s\S]*WHERE ticket_id = \$1/.test(sql)) {
+        return {
+          rows: [{
+            ticket_id: TICKET_ID,
+            status: 'NotVerified',
+            payment_id: PAYMENT_ID,
+            s3_url: 'https://example.com/receipt.pdf',
+          }],
+        };
+      }
+      if (/WHERE payment_id = \$1/.test(sql)) return { rows: [] };
+      return {
+        rows: [{ ticket_id: TICKET_ID, payment_id: replacementPaymentId }],
+      };
+    },
+  };
+
+  const result = await saveManualPaymentId(client, TICKET_ID, replacementPaymentId);
+
+  assert.equal(result.payment_id, replacementPaymentId);
+  assert.deepEqual(queries.at(-1).params, [replacementPaymentId, TICKET_ID, PAYMENT_ID]);
+});
+
+test('manual correction rejects payment IDs on Accepted tickets', async () => {
   const client = {
     async query() {
       return {
@@ -95,8 +126,44 @@ test('manual entry rejects an existing real payment ID', async () => {
 
   await assert.rejects(
     saveManualPaymentId(client, TICKET_ID, 'pay_ZYXWVUTSRQPONM'),
-    error => error.code === 'PAYMENT_ID_ALREADY_PRESENT' && error.httpStatus === 409,
+    error => error.code === 'INVALID_PAYMENT_STATUS'
+      && error.httpStatus === 409
+      && error.currentStatus === 'Accepted',
   );
+});
+
+test('manual correction rejects duplicate payment IDs and reports conflicting tickets', async () => {
+  const conflictingTicketId = '01a08f68-88ac-7abc-8def-533944cbcac8';
+  const replacementPaymentId = 'pay_ZYXWVUTSRQPONM';
+  const queries = [];
+  const client = {
+    async query(sql, params) {
+      queries.push({ sql, params });
+      if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+      if (/FROM public\.ticket_payments[\s\S]*WHERE ticket_id = \$1/.test(sql)) {
+        return {
+          rows: [{
+            ticket_id: TICKET_ID,
+            status: 'NotVerified',
+            payment_id: PAYMENT_ID,
+            s3_url: 'https://example.com/receipt.pdf',
+          }],
+        };
+      }
+      if (/WHERE payment_id = \$1/.test(sql)) return { rows: [{ ticket_id: conflictingTicketId }] };
+      throw new Error(`unexpected query: ${sql}`);
+    },
+  };
+
+  await assert.rejects(
+    saveManualPaymentId(client, TICKET_ID, replacementPaymentId),
+    error => error.code === 'PAYMENT_ID_DUPLICATE'
+      && error.httpStatus === 409
+      && error.conflictingTicketId === conflictingTicketId
+      && error.conflictingTicketIds[0] === conflictingTicketId
+      && error.message.includes(conflictingTicketId),
+  );
+  assert.equal(queries.some(query => /UPDATE public\.ticket_payments/.test(query.sql)), false);
 });
 
 test('manual entry rejects legacy null payment IDs', async () => {

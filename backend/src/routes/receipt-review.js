@@ -34,6 +34,8 @@ function sendDatabaseError(res, error) {
     const body = { error: error.message, code: error.code };
     if (error.currentStatus) body.current_status = error.currentStatus;
     if (error.paymentId) body.payment_id = error.paymentId;
+    if (error.conflictingTicketId) body.conflicting_ticket_id = error.conflictingTicketId;
+    if (Array.isArray(error.conflictingTicketIds)) body.conflicting_ticket_ids = error.conflictingTicketIds;
     return res.status(error.httpStatus).json(body);
   }
 
@@ -220,9 +222,31 @@ function logManualPaymentIdAttempt(req, ticketId, outcome) {
   }));
 }
 
+async function lockPaymentIds(client, paymentIds) {
+  const ids = [...new Set(paymentIds.filter(isPaymentId))].sort();
+  for (const paymentId of ids) {
+    await lockPaymentId(client, paymentId);
+  }
+}
+
 async function saveManualPaymentId(client, ticketId, paymentId) {
-  // Coordinate the manual path with OCR before locking the ticket row.
-  await lockPaymentId(client, paymentId);
+  // Read the current ID before acquiring advisory locks so an edit can lock
+  // both the old and new IDs in a deterministic order. This keeps edits
+  // serialized with conflict resolution and with another manual edit that
+  // targets either ID, before the ticket row is locked.
+  const snapshotResult = await client.query(
+    `SELECT ticket_id, status, payment_id, s3_url
+     FROM public.ticket_payments
+     WHERE ticket_id = $1`,
+    [ticketId],
+  );
+
+  if (snapshotResult.rows.length === 0) {
+    throw httpError(404, 'PAYMENT_NOT_FOUND', 'ticket payment not found');
+  }
+
+  await lockPaymentIds(client, [paymentId, snapshotResult.rows[0].payment_id]);
+
   const paymentResult = await client.query(
     `SELECT ticket_id, status, payment_id, s3_url
      FROM public.ticket_payments
@@ -236,36 +260,59 @@ async function saveManualPaymentId(client, ticketId, paymentId) {
   }
 
   const current = paymentResult.rows[0];
-  if (current.payment_id === null) {
-    throw httpError(409, 'PAYMENT_ID_NOT_QUEUED', 'payment ID is not in the queued state');
-  }
-
-  if (current.payment_id !== 'queued') {
-    throw httpError(409, 'PAYMENT_ID_ALREADY_PRESENT', 'a payment ID is already present for this ticket');
+  if (current.payment_id !== snapshotResult.rows[0].payment_id) {
+    throw httpError(409, 'PAYMENT_ID_CHANGED', 'the payment ID changed while it was being edited; reload and try again');
   }
 
   if (current.status !== 'NotVerified') {
-    throw httpError(409, 'INVALID_PAYMENT_STATUS', 'only NotVerified payments can receive a manual payment ID', {
+    throw httpError(409, 'INVALID_PAYMENT_STATUS', 'only NotVerified payments can receive a payment ID correction', {
       currentStatus: current.status,
     });
   }
 
+  if (current.payment_id === null) {
+    throw httpError(409, 'PAYMENT_ID_NOT_QUEUED', 'payment ID is not in the queued state');
+  }
+
   if (!current.s3_url) {
-    throw httpError(409, 'RECEIPT_URL_MISSING', 'a receipt URL is required before entering a payment ID');
+    throw httpError(409, 'RECEIPT_URL_MISSING', 'a receipt URL is required before correcting a payment ID');
+  }
+
+  const conflictResult = await client.query(
+    `SELECT ticket_id
+     FROM public.ticket_payments
+     WHERE payment_id = $1
+       AND ticket_id <> $2
+     ORDER BY created_at, ticket_id`,
+    [paymentId, ticketId],
+  );
+  const conflictingTicketIds = conflictResult.rows.map(row => row.ticket_id);
+  if (conflictingTicketIds.length > 0) {
+    const ticketNoun = conflictingTicketIds.length === 1 ? 'ticket' : 'tickets';
+    throw httpError(
+      409,
+      'PAYMENT_ID_DUPLICATE',
+      `payment ID is already assigned to ${ticketNoun}: ${conflictingTicketIds.join(', ')}`,
+      {
+        paymentId,
+        conflictingTicketId: conflictingTicketIds[0],
+        conflictingTicketIds,
+      },
+    );
   }
 
   const updateResult = await client.query(
     `UPDATE public.ticket_payments
-     SET payment_id = $1
+     SET payment_id = $1, updated_at = NOW()
      WHERE ticket_id = $2
        AND status = 'NotVerified'
-       AND payment_id = 'queued'
+       AND payment_id = $3
      RETURNING ticket_id, payment_id, updated_at`,
-    [paymentId, ticketId],
+    [paymentId, ticketId, current.payment_id],
   );
 
   if (updateResult.rows.length === 0) {
-    throw httpError(409, 'PAYMENT_ID_ALREADY_PRESENT', 'a payment ID is already present for this ticket');
+    throw httpError(409, 'PAYMENT_ID_CHANGED', 'the payment ID changed while it was being edited; reload and try again');
   }
 
   return updateResult.rows[0];
