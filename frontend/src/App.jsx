@@ -4,8 +4,10 @@ import {
   Routes,
   Route,
   Navigate,
+  useLocation,
+  useNavigate,
 } from "react-router-dom";
-import { AuthProvider } from "./hooks/useAuth";
+import { AuthProvider, useAuth } from "./hooks/useAuth";
 import ScanPage from "./pages/Scan";
 import AttendancePage from "./pages/Attendance";
 import AnalyticsPage from "./pages/Analytics";
@@ -40,11 +42,37 @@ function RequireAuth({ children, roles }) {
   return children;
 }
 
+function LogoutButton() {
+  const { user, logout } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  if (!user || location.pathname === "/login") return null;
+
+  const handleLogout = () => {
+    logout();
+    navigate("/login", { replace: true });
+  };
+
+  return (
+    <div className="flex justify-end px-4 pt-4">
+      <button
+        type="button"
+        onClick={handleLogout}
+        className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-red-600"
+      >
+        Logout
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
   return (
     <AuthProvider>
       <Router>
         <div className="min-h-screen bg-gray-100">
+          <LogoutButton />
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route
