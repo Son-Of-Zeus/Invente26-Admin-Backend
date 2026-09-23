@@ -36,7 +36,7 @@ export default function LoginPage() {
       } else {
         await login(email, password);
       }
-      navigate("/receipt-review");
+      navigate("/reciept-review");
     } catch (requestError) {
       setError(requestError?.response?.data?.error || requestError?.message || "Authentication failed");
     } finally {

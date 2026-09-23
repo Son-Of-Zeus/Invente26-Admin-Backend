@@ -6,8 +6,6 @@ import {
   Navigate,
 } from "react-router-dom";
 import { AuthProvider } from "./hooks/useAuth";
-import TopBar from "./components/TopBar";
-import Home from "./pages/Home";
 import ScanPage from "./pages/Scan";
 import AttendancePage from "./pages/Attendance";
 import AnalyticsPage from "./pages/Analytics";
@@ -47,14 +45,13 @@ export default function App() {
     <AuthProvider>
       <Router>
         <div className="min-h-screen bg-gray-100">
-          <TopBar />
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route
               path="/"
               element={
                 <RequireAuth>
-                  <Home />
+                  <Navigate to="/reciept-review" replace />
                 </RequireAuth>
               }
             />
@@ -119,6 +116,14 @@ export default function App() {
             />
             <Route
               path="/receipt-review"
+              element={
+                <RequireAuth>
+                  <ReceiptReviewPage />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/reciept-review"
               element={
                 <RequireAuth>
                   <ReceiptReviewPage />
