@@ -11,9 +11,9 @@ import inventeLogo from "../assets/invente.png";
 
 // A small helper component to avoid repeating the role check logic
 
-const NavLink = ({ to, children, requiredRoles = [], user, className = "" }) => {
-  // Show the link if no specific roles are required, or if the user has one of the required roles.
-  const isVisible = !requiredRoles || (user && requiredRoles.includes(user.role));
+const NavLink = ({ to, children, requiredRoles = null, user, className = "" }) => {
+  // Every navigation item is authenticated; role arrays further restrict the item.
+  const isVisible = Boolean(user) && (!requiredRoles || requiredRoles.includes(user.role));
 
   if (!isVisible) {
     return null;
@@ -59,6 +59,9 @@ export default function TopBar() {
     navigate('/login');
   };
 
+  const displayRole = String(user?.role || user?.primary_role || user?.roles?.[0] || 'Staff')
+    .replaceAll('_', ' ');
+
   // Define roles for clarity and to reduce repetition
   const registrationRoles = ["volunteer", "super_admin", "master_admin"];
   const workshopRegistrationRoles = ["volunteer", "super_admin", "master_admin", "workshop_admin", "workshop_volunteer"];
@@ -82,6 +85,7 @@ export default function TopBar() {
       <NavLink to="/tech-registration" requiredRoles={registrationRoles} user={user}>Tech Registration</NavLink>
       <NavLink to="/workshop-registration" requiredRoles={workshopRegistrationRoles} user={user}>Workshop Registration</NavLink>
       <NavLink to="/non-tech-registration" requiredRoles={nonTechRegistrationRoles} user={user}>Non-Tech Registration</NavLink>
+      <NavLink to="/receipt-review" user={user}>Receipt Verification</NavLink>
     </>
   );
 
@@ -108,7 +112,7 @@ export default function TopBar() {
             <div className="hidden items-center space-x-4 md:flex">
               <div className="text-right text-sm">
                 <div className="font-medium text-gray-800">{user.email}</div>
-                <div className="text-xs text-gray-500">{user.role.replace('_', ' ')}</div>
+                <div className="text-xs capitalize text-gray-500">{displayRole}</div>
               </div>
               <button
                 onClick={handleLogout}
@@ -152,7 +156,7 @@ export default function TopBar() {
               <div className="flex items-center justify-between">
                 <div className="text-sm">
                   <div className="font-medium text-gray-800">{user.email}</div>
-                  <div className="text-xs text-gray-500">{user.role.replace('_', ' ')}</div>
+                  <div className="text-xs capitalize text-gray-500">{displayRole}</div>
                 </div>
                 <button
                   onClick={handleLogout}

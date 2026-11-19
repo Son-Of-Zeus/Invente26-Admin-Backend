@@ -4,10 +4,10 @@ import {
   Routes,
   Route,
   Navigate,
+  useLocation,
+  useNavigate,
 } from "react-router-dom";
-import { AuthProvider } from "./hooks/useAuth";
-import TopBar from "./components/TopBar";
-import Home from "./pages/Home";
+import { AuthProvider, useAuth } from "./hooks/useAuth";
 import ScanPage from "./pages/Scan";
 import AttendancePage from "./pages/Attendance";
 import AnalyticsPage from "./pages/Analytics";
@@ -16,7 +16,7 @@ import TechRegistrationPage from "./pages/TechRegistration";
 import WorkshopRegistrationPage from "./pages/WorkshopRegistration";
 import NonTechRegistrationPage from "./pages/NonTechRegistration";
 import SuperAdminDump from "./pages/SuperAdminDump";
-import ReceiptTest from "./pages/ReceiptTest";
+import ReceiptReviewPage from "./pages/ReceiptReview";
 
 function RequireAuth({ children, roles }) {
   // simple guard in App; more advanced guard is implemented in pages as needed
@@ -25,14 +25,46 @@ function RequireAuth({ children, roles }) {
   if (!token) return <Navigate to="/login" replace />;
   if (roles) {
     try {
-      const payload = JSON.parse(atob(token.split(".")[1]));
-      if (!roles.includes(payload.role))
+      const encodedPayload = token.split(".")[1];
+      const base64 = encodedPayload.replace(/-/g, "+").replace(/_/g, "/");
+      const payload = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "=")));
+      const tokenRoles = [
+        payload.primary_role,
+        payload.role,
+        ...(Array.isArray(payload.roles) ? payload.roles : []),
+      ].filter(Boolean);
+      if (!roles.some(role => tokenRoles.includes(role)))
         return <div className="p-4">Forbidden</div>;
-    } catch (e) {
+    } catch {
       return <Navigate to="/login" replace />;
     }
   }
   return children;
+}
+
+function LogoutButton() {
+  const { user, logout } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  if (!user || location.pathname === "/login") return null;
+
+  const handleLogout = () => {
+    logout();
+    navigate("/login", { replace: true });
+  };
+
+  return (
+    <div className="flex justify-end px-4 pt-4">
+      <button
+        type="button"
+        onClick={handleLogout}
+        className="rounded-md bg-red-500 px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-red-600"
+      >
+        Logout
+      </button>
+    </div>
+  );
 }
 
 export default function App() {
@@ -40,14 +72,14 @@ export default function App() {
     <AuthProvider>
       <Router>
         <div className="min-h-screen bg-gray-100">
-          <TopBar />
+          <LogoutButton />
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route
               path="/"
               element={
                 <RequireAuth>
-                  <Home />
+                  <Navigate to="/reciept-review" replace />
                 </RequireAuth>
               }
             />
@@ -111,10 +143,18 @@ export default function App() {
               }
             />
             <Route
-              path="/receipt-test"
+              path="/receipt-review"
               element={
-                <RequireAuth roles={["super_admin"]}>
-                  <ReceiptTest />
+                <RequireAuth>
+                  <ReceiptReviewPage />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/reciept-review"
+              element={
+                <RequireAuth>
+                  <ReceiptReviewPage />
                 </RequireAuth>
               }
             />

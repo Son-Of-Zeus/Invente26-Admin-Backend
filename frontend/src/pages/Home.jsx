@@ -8,6 +8,7 @@ import {
   CpuChipIcon,
   WrenchScrewdriverIcon,
   PuzzlePieceIcon,
+  DocumentCheckIcon,
   LockClosedIcon,
 } from "@heroicons/react/24/outline";
 
@@ -91,6 +92,12 @@ export default function Home() {
       to: "/non-tech-registration",
       roles: ["master_admin", "dept_admin", ...registrationRoles],
       icon: PuzzlePieceIcon,
+    },
+    {
+      title: "Receipt Verification",
+      desc: "Review uploaded payment receipts and record decisions.",
+      to: "/receipt-review",
+      icon: DocumentCheckIcon,
     },
     {
       title: "Database",

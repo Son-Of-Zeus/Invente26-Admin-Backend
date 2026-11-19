@@ -1,190 +1,133 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { useAuth } from "../hooks/useAuth";
 import { useNavigate } from "react-router-dom";
-import axios from "axios";
 
 export default function LoginPage() {
-  const [email, setEmail] = useState("admin@invente.local");
-  const [password, setPassword] = useState("password");
-  const [role, setRole] = useState("");
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [name, setName] = useState("");
-  const [personalEmail, setPersonalEmail] = useState("");
-  const [phone, setPhone] = useState("");
-  const [eventId, setEventId] = useState("");
-  const [events, setEvents] = useState([]);
-  const [otp, setOtp] = useState("");
-  const [otpSent, setOtpSent] = useState(false);
-  const [sendingOtp, setSendingOtp] = useState(false);
-  const [err, setErr] = useState(null);
-  const { login } = useAuth();
-  const nav = useNavigate();
+  const [dept, setDept] = useState("");
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const { login, signup } = useAuth();
+  const navigate = useNavigate();
 
-  useEffect(() => {
-    const fetchEvents = async () => {
-      try {
-        const base = import.meta.env.VITE_API_BASE || "http://localhost:4000";
-        const resp = await axios.get(`${base}/events/public`);
-        setEvents(resp.data.rows || []);
-      } catch (_) {}
-    };
-    fetchEvents();
-  }, []);
+  const isSignup = mode === "signup";
 
-  const isValidInstitutionEmail = (e) => {
-    const lower = String(e || "").toLowerCase();
-    return lower.endsWith("@ssn.edu.in") || lower.endsWith("@snuchennai.edu.in");
-  };
+  function switchMode(nextMode) {
+    setMode(nextMode);
+    setError(null);
+  }
 
-  const requestOtp = async () => {
-    setErr(null);
-    const trimmedName = name?.trim();
-    const trimmedPersonalEmail = personalEmail?.trim();
-    
-    if (!trimmedName || !trimmedPersonalEmail) {
-      setErr("Enter name and personal email");
-      return;
-    }
-    if (!isValidInstitutionEmail(trimmedPersonalEmail)) {
-      setErr("Email must end with @ssn.edu.in or @snuchennai.edu.in");
-      return;
-    }
-    setSendingOtp(true);
+  async function onSubmit(event) {
+    event.preventDefault();
+    setError(null);
+    setLoading(true);
+
     try {
-      const base = import.meta.env.VITE_API_BASE || "http://localhost:4000";
-      await axios.post(`${base}/auth/send-otp`, { personalEmail: trimmedPersonalEmail, name: trimmedName });
-      setOtpSent(true);
-    } catch (e) {
-      setErr(e?.response?.data?.error || String(e));
+      if (isSignup) {
+        await signup({
+          email,
+          password,
+          name,
+          dept: dept || null,
+        });
+      } else {
+        await login(email, password);
+      }
+      navigate("/reciept-review");
+    } catch (requestError) {
+      setError(requestError?.response?.data?.error || requestError?.message || "Authentication failed");
     } finally {
-      setSendingOtp(false);
+      setLoading(false);
     }
-  };
-
-  const onSubmit = async (e) => {
-    e.preventDefault();
-    setErr(null);
-    try {
-      // Trim all input values as safety net
-      const trimmedEmail = email?.trim();
-      const trimmedPassword = password?.trim();
-      const trimmedName = name?.trim();
-      const trimmedPersonalEmail = personalEmail?.trim();
-      const trimmedPhone = phone?.trim();
-      const trimmedOtp = otp?.trim();
-      
-      const profile = {};
-      if (trimmedName && trimmedPersonalEmail) {
-        if (String(trimmedPersonalEmail).toLowerCase() === String(trimmedEmail).toLowerCase()) {
-          setErr("Personal email must differ from admin email");
-          return;
-        }
-        if (!otpSent) {
-          setErr("Please request and enter OTP first");
-          return;
-        }
-        if (!trimmedOtp || String(trimmedOtp).length !== 5) {
-          setErr("Enter the 5-digit OTP");
-          return;
-        }
-        profile.name = trimmedName;
-        profile.personalEmail = trimmedPersonalEmail;
-        profile.otp = trimmedOtp;
-        if (trimmedPhone) profile.phone = trimmedPhone;
-        if (role) profile.role = role;
-        if (role === 'event_admin') profile.eventId = eventId ? Number(eventId) : undefined;
-      }
-      // Always include role for validation even if no profile data
-      if (role && !profile.role) {
-        profile.role = role;
-      }
-      await login(trimmedEmail, trimmedPassword, profile);
-      nav("/");
-    } catch (err) {
-      setErr(err.response?.data?.error || String(err));
-    }
-  };
+  }
 
   return (
-    <div className="max-w-md mx-auto mt-8 md:mt-16 m-4 p-6 bg-white shadow rounded">
-      <h2 className="text-xl md:text-2xl font-semibold mb-6">Login to Invente25 Admin</h2>
-      <form onSubmit={onSubmit} className="space-y-4">
-        <div>
-          <label className="block text-sm">Email</label>
-          <input
-            value={email}
-            onChange={(e) => setEmail(e.target.value.trim())}
-            className="w-full border p-2 rounded"
-          />
-        </div>
-        <div>
-          <label className="block text-sm">Password</label>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value.trim())}
-            className="w-full border p-2 rounded"
-          />
-        </div>
+    <div className="mx-auto mt-8 max-w-md p-4 md:mt-16">
+      <div className="rounded bg-white p-6 shadow">
+        <h2 className="mb-2 text-xl font-semibold md:text-2xl">
+          {isSignup ? "Create volunteer account" : "Volunteer login"}
+        </h2>
+        <p className="mb-6 text-sm text-gray-600">
+          {isSignup
+            ? "Only emails approved by the registration team can sign up."
+            : "Sign in to review payment receipts."}
+        </p>
 
-        <div className="border-t pt-4 space-y-3">
-          <div>
-            <label className="block text-sm">Your Role</label>
-            <select value={role} onChange={e => setRole(e.target.value)} className="w-full border p-2 rounded">
-              <option value="">Select your role</option>
-              <option value="volunteer">Volunteer</option>
-              <option value="dept_admin">Department Admin</option>
-              <option value="event_admin">Event Admin</option>
-              <option value="master_admin">Master Admin</option>
-              <option value="workshop_admin">Workshop Admin</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="block text-sm">Name</label>
-            <input value={name} onChange={e => setName(e.target.value.trim())} className="w-full border p-2 rounded" />
-          </div>
-          <div>
-            <label className="block text-sm">College Email</label>
-            <input value={personalEmail} onChange={e => setPersonalEmail(e.target.value.trim())} className="w-full border p-2 rounded" />
-          </div>
-          <div>
-            <label className="block text-sm">Phone</label>
-            <input value={phone} onChange={e => setPhone(e.target.value.trim())} className="w-full border p-2 rounded" />
-          </div>
-
-          {role === 'event_admin' && (
-            <div>
-              <label className="block text-sm">Event in charge</label>
-              <select value={eventId} onChange={e => setEventId(e.target.value)} className="w-full border p-2 rounded">
-                <option value="">Select event</option>
-                {events.map(ev => (
-                  <option key={ev.external_id} value={ev.external_id}>{ev.name} {ev.department_name ? `— ${ev.department_name}` : ''}</option>
-                ))}
-              </select>
-            </div>
+        <form onSubmit={onSubmit} className="space-y-4">
+          {isSignup && (
+            <>
+              <label className="block text-sm font-medium text-gray-700">
+                Full name
+                <input
+                  required
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  autoComplete="name"
+                  className="mt-1 w-full rounded border p-2 font-normal"
+                />
+              </label>
+              <label className="block text-sm font-medium text-gray-700">
+                Department <span className="font-normal text-gray-400">(optional)</span>
+                <input
+                  value={dept}
+                  onChange={(event) => setDept(event.target.value)}
+                  className="mt-1 w-full rounded border p-2 font-normal"
+                />
+              </label>
+            </>
           )}
 
-          <div className="flex items-center gap-2">
-            <button type="button" onClick={requestOtp} className="px-3 py-1 bg-gray-700 text-white rounded flex items-center gap-2" disabled={sendingOtp}>
-              {sendingOtp && (
-                <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-              )}
-              {sendingOtp ? 'Sending...' : (otpSent ? 'Resend OTP' : 'Send OTP')}
-            </button>
-            <input placeholder="Enter 5-digit OTP" value={otp} onChange={e => setOtp(e.target.value.trim())} className="border p-2 rounded flex-1" />
-          </div>
-          <div className="text-xs text-gray-500">Only institution emails allowed: @ssn.edu.in or @snuchennai.edu.in</div>
-        </div>
-        {err && <div className="text-red-500">{err}<br />Try reloading/logging out and back in</div>}
-        <div className="flex justify-end">
-          <button className="px-4 py-2 bg-blue-600 text-white rounded">
-            Login
+          <label className="block text-sm font-medium text-gray-700">
+            Email
+            <input
+              required
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              autoComplete="email"
+              className="mt-1 w-full rounded border p-2 font-normal"
+            />
+          </label>
+
+          <label className="block text-sm font-medium text-gray-700">
+            Password
+            <input
+              required
+              type="password"
+              minLength={isSignup ? 8 : undefined}
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              autoComplete={isSignup ? "new-password" : "current-password"}
+              className="mt-1 w-full rounded border p-2 font-normal"
+            />
+            {isSignup && <span className="mt-1 block text-xs font-normal text-gray-500">Use at least 8 characters.</span>}
+          </label>
+
+          {error && <div className="rounded border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>}
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full rounded bg-blue-600 px-4 py-2 font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {loading ? "Please wait…" : isSignup ? "Create account" : "Login"}
+          </button>
+        </form>
+
+        <div className="mt-5 text-center text-sm text-gray-600">
+          {isSignup ? "Already have an account?" : "Need to register as a volunteer?"}{" "}
+          <button
+            type="button"
+            onClick={() => switchMode(isSignup ? "login" : "signup")}
+            className="font-semibold text-blue-600 hover:underline"
+          >
+            {isSignup ? "Login" : "Sign up"}
           </button>
         </div>
-      </form>
+      </div>
     </div>
   );
 }

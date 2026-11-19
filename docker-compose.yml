@@ -1,56 +1,14 @@
 services:
-  db:
-    image: postgres:15
-    environment:
-      POSTGRES_DB: invente25
-      POSTGRES_USER: invente25
-      POSTGRES_PASSWORD: invente25pw
-    ports:
-      - "5432:5432"
-    volumes:
-      - db_data:/var/lib/postgresql/data
-      # - ./backend/migrations:/docker-entrypoint-initdb.d # bind mount the migrations directory to the container so that it runs the migration scripts on startup only once
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U invente25"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
   backend:
     build: ./backend
-    # image: irfanakthar/invente25-admin-backend:v2
+    container_name: invente26-admin-backend
+    env_file:
+      - ./backend/.env
     environment:
       - PORT=4000
-      - DATABASE_URL=postgres://invente25:invente25pw@db:5432/invente25
-      - JWT_SECRET=${JWT_SECRET}
-      - PAYMENT_VERIF_URL=http://payment-verif.local/verify-cash
-      - PAYMENT_VERIF_API_KEY=devapikey
-      - SYNC_EVENTS_ENABLED=true
-      - SYNC_EVENTS_CRON=*/2 * * * * # every 2 minutes and once per startup
-      - EVENTS_API_URL=https://ssnsnucinvente.com/api/events?pagination[pageSize]=140
-      - PAYMENT_SERVICE_URL=http://localhost:8080/api/payment
-      - RECEIPT_SERVICE_URL=http://localhost:8080/restricted/receipt
-      - MASTER_PW=itsmeirfan
-      - TECH_PASS_PRICE=300
-      - NON_TECH_DEFAULT_PRICE=300
-      - WORKSHOP_PRICE=300
-      - PAYMENT_SERVICE_SECRET=rjkgsigirgrlgrl123y4t5u6i7o8p0d
-      - MAIL_SERVICE_SECRET=rjkgsigirgrlgrl123y4t5u6i7o8p0d
-      - GOOGLE_APPLICATION_CREDENTIALS=credentials.json
-      - MASTER_ADMIN_EMAILS=irfanakthar@ssn.edu.in
-      - MAIL_SERVICE_URL=http://localhost:8080/api/sendOTP
+      - TZ=Asia/Kolkata
     ports:
       - "4000:4000"
-    depends_on:
-      db:
-        condition: service_healthy
     # volumes: 
       # - ./backend:/usr/src/app # defeats the purpose of the image
       # - /usr/src/app/node_modules # same reason as above
@@ -66,30 +24,33 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    
+    networks:
+      - default
+      - payment_backend_network
 
-  frontend:
-    build: ./frontend
-    #image: irfanakthar/invente25-admin-frontend:v1
-    ports:
-      - "3000:3000"
-    depends_on:
-      - backend
+  payment-ocr-worker:
+    build: ./backend
+    env_file:
+      - ./backend/.env
+    command: npm run worker:ocr
     environment:
-      - VITE_API_URL=http://localhost:4000
-      - VITE_TECH_PASS_PRICE=300
-      - VITE_WORKSHOP_PRICE=300
-      - VITE_NON_TECH_DEFAULT_PRICE=300
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+      - TZ=Asia/Kolkata
+      - REDIS_HOST=invente-redis-dev
+      - REDIS_PORT=6379
+    stop_grace_period: 130s
     restart: unless-stopped
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+    networks:
+      - payment_backend_network
+
 volumes:
   db_data:
+networks:
+  payment_backend_network:
+    external: true
+    name: server-only-compose_backend-network

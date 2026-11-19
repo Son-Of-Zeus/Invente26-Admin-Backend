@@ -1,14 +1,18 @@
 // index.js
 require('dotenv').config();
+
+// The participant schema stores timestamp-without-timezone values as IST.
+// Set Node's timezone before loading routes so node-postgres parses them as IST.
+process.env.TZ = process.env.TZ || 'Asia/Kolkata';
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const cron = require('node-cron');
 
-const { loginHandler, authMiddleware } = require('./auth');
+const { router: staffAuthRouter } = require('./routes/staff-auth');
 const otpRouter = require('./routes/otp');
 const { syncEvents } = require('./jobs/syncEvents');
-const MigrationRunner = require('../migrations/migrationRunner');
 
 // finally refactored the huge index.js into separate route files :)
 const scanRouter = require('./routes/scan');
@@ -19,7 +23,8 @@ const techRegistrationRouter = require('./routes/tech-registration');
 const workshopRegistrationRouter = require('./routes/workshop-registration');
 const nonTechRegistrationRouter = require('./routes/non-tech-registration');
 const adminRouter = require('./routes/admin');
-const receiptRouter = require('./routes/receipt');
+const receiptUploadRouter = require('./routes/receipt-upload');
+const receiptReviewRouter = require('./routes/receipt-review');
 
 const app = express();
 app.use(bodyParser.json());
@@ -44,7 +49,7 @@ app.get('/sync-status', (req, res) => {
 const baseRouter = express.Router();
 
 // auth
-baseRouter.post('/auth/login', loginHandler);
+baseRouter.use('/auth', staffAuthRouter);
 baseRouter.use('/auth', otpRouter);
 
 // mount routers
@@ -56,7 +61,8 @@ baseRouter.use('/tech-registration', techRegistrationRouter); // tech registrati
 baseRouter.use('/workshop-registration', workshopRegistrationRouter); // workshop registration endpoint
 baseRouter.use('/non-tech-registration', nonTechRegistrationRouter); // non-tech registration endpoint
 baseRouter.use('/admin', adminRouter); // superadmin-only admin utilities
-app.use('/', receiptRouter); // receipt OCR endpoint (no auth)
+baseRouter.use('/public/registrations', receiptUploadRouter); // participant PDF upload tickets and Azure HEAD validation
+baseRouter.use('/receipt-review', receiptReviewRouter); // volunteer receipt queue and decisions
 
 // Mount base router
 app.use('/organizers/api', baseRouter);
@@ -64,15 +70,16 @@ app.use('/organizers/api', baseRouter);
 // Initialize and start the server
 async function startServer() {
   try {
-    // Run database migrations first
-    const migrationRunner = new MigrationRunner();
-    await migrationRunner.runMigrations();
-    
+    // This service consumes the participant repository's schema. It must not
+    // create or alter tables at startup.
     app.listen(PORT, () => {
       console.log(`Invente25 admin backend listening on ${PORT}`);
       
       // Set up events sync cron job
-      if (process.env.SYNC_EVENTS_ENABLED === 'true') {
+      // Attendance/event-sync code remains mounted for the later phase, but
+      // is opt-in while this service is using the participant schema.
+      if (process.env.SYNC_EVENTS_ENABLED === 'true'
+        && process.env.LEGACY_ATTENDANCE_JOBS_ENABLED === 'true') {
         // Run every 2 minutes by default (more reasonable for external API calls)
         const cronSchedule = process.env.SYNC_EVENTS_CRON || '*/2 * * * *';
         cron.schedule(cronSchedule, () => {
@@ -93,4 +100,3 @@ async function startServer() {
 
 // Start the server
 startServer();
-
